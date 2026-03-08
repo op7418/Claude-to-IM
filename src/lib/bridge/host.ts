@@ -207,6 +207,7 @@ export interface StreamChatParams {
   workingDirectory?: string;
   abortController?: AbortController;
   permissionMode?: string;
+  allowDangerouslySkipPermissions?: boolean;
   provider?: BridgeApiProvider;
   conversationHistory?: Array<{ role: 'user' | 'assistant'; content: string }>;
   files?: FileAttachment[];

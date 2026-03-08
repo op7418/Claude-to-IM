@@ -347,7 +347,7 @@ export class TelegramAdapter extends BaseChannelAdapter {
         { command: 'new', description: 'Start new session (optionally specify path)' },
         { command: 'bind', description: 'Bind to existing session' },
         { command: 'cwd', description: 'Change working directory' },
-        { command: 'mode', description: 'Switch mode: plan / code / ask' },
+        { command: 'mode', description: 'Switch mode: plan / code / ask / yolo' },
         { command: 'status', description: 'Show current session status' },
         { command: 'sessions', description: 'List recent sessions' },
         { command: 'stop', description: 'Stop current task' },
