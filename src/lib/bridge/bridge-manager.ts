@@ -664,7 +664,7 @@ async function handleCommand(
         '/new [path] - Start new session',
         '/bind &lt;session_id&gt; - Bind to existing session',
         '/cwd /path - Change working directory',
-        '/mode plan|code|ask - Change mode',
+        '/mode plan|code|ask|yolo - Change mode',
         '/status - Show current status',
         '/sessions - List recent sessions',
         '/stop - Stop current session',
@@ -723,13 +723,35 @@ async function handleCommand(
     }
 
     case '/mode': {
-      if (!validateMode(args)) {
-        response = 'Usage: /mode plan|code|ask';
+      // Parse mode from first word (supports "/mode yolo confirm")
+      const modeParts = args.split(/\s+/);
+      const modeArg = modeParts[0] || '';
+      const modeConfirm = modeParts[1] || '';
+
+      if (!validateMode(modeArg)) {
+        response = 'Usage: /mode plan|code|ask|yolo';
         break;
       }
+
+      // Yolo mode requires explicit confirmation
+      if (modeArg === 'yolo' && modeConfirm !== 'confirm') {
+        response = [
+          '\u26a0\ufe0f <b>WARNING: yolo mode skips ALL permission checks.</b>',
+          '',
+          'Claude will execute file edits, shell commands, and other tools <b>without asking for approval</b>.',
+          '',
+          'To confirm, type: <code>/mode yolo confirm</code>',
+        ].join('\n');
+        break;
+      }
+
       const binding = router.resolve(msg.address);
-      router.updateBinding(binding.id, { mode: args });
-      response = `Mode set to <b>${args}</b>`;
+      router.updateBinding(binding.id, { mode: modeArg });
+      if (modeArg === 'yolo') {
+        response = '\u26a0\ufe0f Mode set to <b>yolo</b> — all permission checks disabled';
+      } else {
+        response = `Mode set to <b>${modeArg}</b>`;
+      }
       break;
     }
 
@@ -740,7 +762,7 @@ async function handleCommand(
         '',
         `Session: <code>${binding.codepilotSessionId.slice(0, 8)}...</code>`,
         `CWD: <code>${escapeHtml(binding.workingDirectory || '~')}</code>`,
-        `Mode: <b>${binding.mode}</b>`,
+        `Mode: <b>${binding.mode}</b>${binding.mode === 'yolo' ? ' \u26a0\ufe0f' : ''}`,
         `Model: <code>${binding.model || 'default'}</code>`,
       ].join('\n');
       break;
@@ -802,7 +824,7 @@ async function handleCommand(
         '/new [path] - Start new session',
         '/bind &lt;session_id&gt; - Bind to existing session',
         '/cwd /path - Change working directory',
-        '/mode plan|code|ask - Change mode',
+        '/mode plan|code|ask|yolo - Change mode',
         '/status - Show current status',
         '/sessions - List recent sessions',
         '/stop - Stop current session',

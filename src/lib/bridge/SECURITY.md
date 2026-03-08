@@ -27,7 +27,7 @@ Unauthorized messages are silently dropped (no response leak).
 - `validateSessionId()`: Hex/UUID format, 32-64 chars
 - `isDangerousInput()`: Detects path traversal, command injection, null bytes, control characters
 - `sanitizeInput()`: Strips control characters (except `\n`, `\t`), enforces max length (10,000 chars)
-- `validateMode()`: Whitelist (`plan`, `code`, `ask`)
+- `validateMode()`: Whitelist (`plan`, `code`, `ask`, `yolo`)
 
 ### Rate Limiting (`security/rate-limiter.ts`)
 

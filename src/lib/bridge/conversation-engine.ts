@@ -135,9 +135,14 @@ export async function processMessage(
 
     // Permission mode from binding mode
     let permissionMode: string;
+    let allowDangerouslySkipPermissions = false;
     switch (binding.mode) {
       case 'plan': permissionMode = 'plan'; break;
       case 'ask': permissionMode = 'default'; break;
+      case 'yolo':
+        permissionMode = 'bypassPermissions';
+        allowDangerouslySkipPermissions = true;
+        break;
       default: permissionMode = 'acceptEdits'; break;
     }
 
@@ -166,6 +171,7 @@ export async function processMessage(
       workingDirectory: binding.workingDirectory || session?.working_directory || undefined,
       abortController,
       permissionMode,
+      allowDangerouslySkipPermissions,
       provider: resolvedProvider,
       conversationHistory: historyMsgs,
       files,
