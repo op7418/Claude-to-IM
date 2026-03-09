@@ -157,13 +157,24 @@ export async function processMessage(
       }
     }
 
+    // workingDirectory 不存在时，SDK spawn 会报误导性的 ENOENT（看起来像是可执行文件找不到）
+    // 这里做校验并 fallback，避免难以排查的错误
+    let workingDirectory = binding.workingDirectory || session?.working_directory || undefined;
+    if (workingDirectory && !fs.existsSync(workingDirectory)) {
+      const fallback = process.env.CTI_DEFAULT_WORKDIR || process.cwd();
+      console.warn(
+        `[conversation-engine] workingDirectory "${workingDirectory}" does not exist, falling back to "${fallback}"`,
+      );
+      workingDirectory = fallback;
+    }
+
     const stream = llm.streamChat({
       prompt: text,
       sessionId,
       sdkSessionId: binding.sdkSessionId || undefined,
       model: effectiveModel,
       systemPrompt: session?.system_prompt || undefined,
-      workingDirectory: binding.workingDirectory || session?.working_directory || undefined,
+      workingDirectory,
       abortController,
       permissionMode,
       provider: resolvedProvider,
