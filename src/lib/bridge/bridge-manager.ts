@@ -468,6 +468,24 @@ async function handleMessage(
     return;
   }
 
+  // Check for digit shortcut (1/2/3) for quick permission response.
+  // Only intercept if there IS a pending shortcut — otherwise fall through
+  // to conversation engine so the user's message is not lost.
+  if (/^[123]$/.test(rawText)) {
+    const result = broker.resolveShortcut(msg.address.chatId, parseInt(rawText, 10));
+    if (result.handled) {
+      await deliver(adapter, {
+        address: msg.address,
+        text: `Permission ${result.action}: recorded.`,
+        parseMode: 'plain',
+        replyToMessageId: msg.messageId,
+      });
+      ack();
+      return;
+    }
+    // No pending permission — fall through to conversation engine
+  }
+
   // Sanitize general message text before routing to conversation engine
   const { text, truncated } = sanitizeInput(rawText);
   if (truncated) {

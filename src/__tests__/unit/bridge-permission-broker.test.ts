@@ -10,8 +10,10 @@
 import { describe, it, beforeEach } from 'node:test';
 import assert from 'node:assert/strict';
 import { initBridgeContext } from '../../lib/bridge/context';
-import { handlePermissionCallback } from '../../lib/bridge/permission-broker';
+import { handlePermissionCallback, resolveShortcut, _testOnly } from '../../lib/bridge/permission-broker';
 import type { BridgeStore, PermissionGateway, PermissionResolution } from '../../lib/bridge/host';
+
+const { registerShortcut, clearShortcut, pendingShortcuts } = _testOnly;
 
 // ── Mock Store ──────────────────────────────────────────────
 
@@ -197,5 +199,138 @@ describe('permission-broker', () => {
     assert.ok(result);
     assert.equal(gateway.resolved[0].resolution.behavior, 'allow');
     assert.ok((gateway.resolved[0].resolution as any).updatedPermissions);
+  });
+});
+
+// ── Digit Shortcut Tests ──────────────────────────────────────
+
+describe('permission-broker digit shortcuts', () => {
+  let store: MockStore;
+  let gateway: MockGateway;
+
+  beforeEach(() => {
+    store = createMockStore();
+    gateway = createMockGateway();
+    setupContext(store, gateway);
+    // Clear any leftover shortcuts from previous tests
+    pendingShortcuts.clear();
+  });
+
+  it('resolveShortcut returns not handled when no shortcut registered', () => {
+    const result = resolveShortcut('chat-1', 1);
+    assert.equal(result.handled, false);
+  });
+
+  it('resolveShortcut resolves digit 1 to allow', () => {
+    // Register a shortcut and matching permission link
+    store.links.set('perm-s1', {
+      chatId: 'chat-1',
+      messageId: 'msg-s1',
+      resolved: false,
+      suggestions: '',
+    });
+    registerShortcut('chat-1', 'perm-s1');
+
+    const result = resolveShortcut('chat-1', 1);
+    assert.ok(result.handled);
+    assert.equal(result.action, 'allow');
+    assert.equal(gateway.resolved.length, 1);
+    assert.equal(gateway.resolved[0].resolution.behavior, 'allow');
+  });
+
+  it('resolveShortcut resolves digit 2 to allow_session', () => {
+    store.links.set('perm-s2', {
+      chatId: 'chat-2',
+      messageId: 'msg-s2',
+      resolved: false,
+      suggestions: '',
+    });
+    registerShortcut('chat-2', 'perm-s2');
+
+    const result = resolveShortcut('chat-2', 2);
+    assert.ok(result.handled);
+    assert.equal(result.action, 'allow_session');
+  });
+
+  it('resolveShortcut resolves digit 3 to deny', () => {
+    store.links.set('perm-s3', {
+      chatId: 'chat-3',
+      messageId: 'msg-s3',
+      resolved: false,
+      suggestions: '',
+    });
+    registerShortcut('chat-3', 'perm-s3');
+
+    const result = resolveShortcut('chat-3', 3);
+    assert.ok(result.handled);
+    assert.equal(result.action, 'deny');
+    assert.equal(gateway.resolved[0].resolution.behavior, 'deny');
+  });
+
+  it('resolveShortcut clears shortcut after successful resolution', () => {
+    store.links.set('perm-s4', {
+      chatId: 'chat-4',
+      messageId: 'msg-s4',
+      resolved: false,
+      suggestions: '',
+    });
+    registerShortcut('chat-4', 'perm-s4');
+
+    resolveShortcut('chat-4', 1);
+    // Shortcut should be cleared
+    assert.equal(pendingShortcuts.has('chat-4'), false);
+  });
+
+  it('resolveShortcut returns not handled for expired shortcuts', () => {
+    store.links.set('perm-s5', {
+      chatId: 'chat-5',
+      messageId: 'msg-s5',
+      resolved: false,
+      suggestions: '',
+    });
+    registerShortcut('chat-5', 'perm-s5');
+
+    // Manually expire the shortcut
+    const shortcut = pendingShortcuts.get('chat-5')!;
+    shortcut.expireAt = Date.now() - 1;
+
+    const result = resolveShortcut('chat-5', 1);
+    assert.equal(result.handled, false);
+  });
+
+  it('new shortcut overwrites old one for same chat', () => {
+    store.links.set('perm-old', {
+      chatId: 'chat-6',
+      messageId: 'msg-old',
+      resolved: false,
+      suggestions: '',
+    });
+    store.links.set('perm-new', {
+      chatId: 'chat-6',
+      messageId: 'msg-new',
+      resolved: false,
+      suggestions: '',
+    });
+
+    registerShortcut('chat-6', 'perm-old');
+    registerShortcut('chat-6', 'perm-new');
+
+    const result = resolveShortcut('chat-6', 1);
+    assert.ok(result.handled);
+    // Should resolve the new permission, not the old one
+    assert.equal(gateway.resolved[0].id, 'perm-new');
+  });
+
+  it('resolveShortcut returns not handled for invalid digit', () => {
+    store.links.set('perm-s7', {
+      chatId: 'chat-7',
+      messageId: 'msg-s7',
+      resolved: false,
+      suggestions: '',
+    });
+    registerShortcut('chat-7', 'perm-s7');
+
+    const result = resolveShortcut('chat-7', 4);
+    assert.equal(result.handled, false);
   });
 });

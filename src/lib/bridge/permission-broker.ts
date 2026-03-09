@@ -23,6 +23,71 @@ import { escapeHtml } from './adapters/telegram-utils.js';
 const recentPermissionForwards = new Map<string, number>();
 
 /**
+ * Per-chat pending permission shortcut mapping.
+ * When a permission card is sent, we register a shortcut so users can
+ * reply with 1/2/3 instead of typing the full /perm command.
+ * Each chat keeps only the latest pending permission (new overwrites old).
+ */
+interface PendingShortcut {
+  permId: string;
+  actions: readonly ['allow', 'allow_session', 'deny'];
+  expireAt: number;
+}
+
+const SHORTCUT_TTL_MS = 5 * 60 * 1000; // 5 minutes
+const pendingShortcuts = new Map<string, PendingShortcut>();
+
+/**
+ * Register a digit shortcut mapping for a chat after sending a permission card.
+ */
+function registerShortcut(chatId: string, permId: string): void {
+  pendingShortcuts.set(chatId, {
+    permId,
+    actions: ['allow', 'allow_session', 'deny'],
+    expireAt: Date.now() + SHORTCUT_TTL_MS,
+  });
+}
+
+/**
+ * Clear the pending shortcut for a chat (called after resolution).
+ */
+function clearShortcut(chatId: string): void {
+  pendingShortcuts.delete(chatId);
+}
+
+/**
+ * Resolve a digit shortcut (1/2/3) for a given chat.
+ * Returns the result of handlePermissionCallback if a mapping exists.
+ */
+export function resolveShortcut(
+  chatId: string,
+  digit: number,
+): { handled: boolean; action?: string } {
+  const shortcut = pendingShortcuts.get(chatId);
+  if (!shortcut) return { handled: false };
+
+  // Check expiry
+  if (Date.now() > shortcut.expireAt) {
+    pendingShortcuts.delete(chatId);
+    return { handled: false };
+  }
+
+  // digit is 1-indexed, actions array is 0-indexed
+  const action = shortcut.actions[digit - 1];
+  if (!action) return { handled: false };
+
+  const callbackData = `perm:${action}:${shortcut.permId}`;
+  const resolved = handlePermissionCallback(callbackData, chatId);
+
+  if (resolved) {
+    clearShortcut(chatId);
+    return { handled: true, action };
+  }
+
+  return { handled: false };
+}
+
+/**
  * Forward a permission request to an IM channel as an interactive message.
  */
 export async function forwardPermissionRequest(
@@ -60,14 +125,19 @@ export async function forwardPermissionRequest(
   let result: import('./types.js').SendResult;
 
   if (adapter.channelType === 'qq') {
-    // QQ: plain text permission prompt with copyable /perm commands (no inline buttons)
+    // QQ: plain text permission prompt with digit shortcuts (no inline buttons)
     const qqText = [
       `Permission Required`,
       ``,
       `Tool: ${toolName}`,
       truncatedInput,
       ``,
-      `Reply with one of:`,
+      `Reply with:`,
+      `1 - Allow`,
+      `2 - Allow for this session`,
+      `3 - Deny`,
+      ``,
+      `Or use commands:`,
       `/perm allow ${permissionRequestId}`,
       `/perm allow_session ${permissionRequestId}`,
       `/perm deny ${permissionRequestId}`,
@@ -120,6 +190,11 @@ export async function forwardPermissionRequest(
         suggestions: suggestions ? JSON.stringify(suggestions) : '',
       });
     } catch { /* best effort */ }
+
+    // Register digit shortcut for non-Telegram channels (Telegram has inline buttons)
+    if (adapter.channelType !== 'telegram') {
+      registerShortcut(address.chatId, permissionRequestId);
+    }
   }
 }
 
@@ -224,3 +299,7 @@ export function handlePermissionCallback(
 
   return resolved;
 }
+
+// ── Test-only exports ────────────────────────────────────────
+/** @internal */
+export const _testOnly = { registerShortcut, clearShortcut, pendingShortcuts };
