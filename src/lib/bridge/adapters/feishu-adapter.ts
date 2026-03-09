@@ -373,24 +373,29 @@ export class FeishuAdapter extends BaseChannelAdapter {
       return { ok: false, error: 'Feishu client not initialized' };
     }
 
-    // Build /perm command lines from inline buttons
+    // Build digit shortcut lines + collapsible /perm commands
     const permCommands = inlineButtons.flat().map((btn) => {
       if (btn.callbackData.startsWith('perm:')) {
         const parts = btn.callbackData.split(':');
         const action = parts[1];
         const permId = parts.slice(2).join(':');
-        return `\`/perm ${action} ${permId}\``;
+        return `/perm ${action} ${permId}`;
       }
       return btn.text;
     });
 
-    // Schema 2.0 card with markdown — permission info + copyable commands
+    // Schema 2.0 card with markdown — digit shortcuts + fallback commands
     const cardContent = [
       text,
       '',
       '---',
-      '**Reply with one of these commands:**',
-      ...permCommands,
+      '**Reply with:**',
+      '**1** - Allow',
+      '**2** - Allow for this session',
+      '**3** - Deny',
+      '',
+      '*Or use commands:*',
+      ...permCommands.map((cmd) => `\`${cmd}\``),
     ].join('\n');
 
     const cardJson = JSON.stringify({
@@ -424,15 +429,8 @@ export class FeishuAdapter extends BaseChannelAdapter {
       console.warn('[feishu-adapter] Permission card error:', err instanceof Error ? err.message : err);
     }
 
-    // Fallback: plain text
-    const plainCommands = inlineButtons.flat().map((btn) => {
-      if (btn.callbackData.startsWith('perm:')) {
-        const parts = btn.callbackData.split(':');
-        return `/perm ${parts[1]} ${parts.slice(2).join(':')}`;
-      }
-      return btn.text;
-    });
-    const fallbackText = text + '\n\nReply with:\n' + plainCommands.join('\n');
+    // Fallback: plain text with digit shortcuts
+    const fallbackText = text + '\n\nReply with:\n1 - Allow\n2 - Allow for this session\n3 - Deny\n\nOr use commands:\n' + permCommands.join('\n');
 
     try {
       const res = await this.restClient.im.message.create({
