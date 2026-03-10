@@ -69,6 +69,103 @@ type FeishuMessageEventData = {
   };
 };
 
+type FeishuCardActionValue = {
+  callback_data?: string;
+  callbackData?: string;
+  value?: string;
+};
+
+type FeishuCardActionResponse = {
+  toast?: {
+    type: 'info' | 'success' | 'error' | 'warning';
+    content: string;
+  };
+  card?: {
+    type: 'raw';
+    data: {
+      schema: '2.0';
+      config: { wide_screen_mode: boolean };
+      header: {
+        template: string;
+        title: { tag: 'plain_text'; content: string };
+      };
+      body: {
+        elements: Array<{
+          tag: 'markdown';
+          content: string;
+        }>;
+      };
+    };
+  };
+};
+
+export function extractCardActionCallbackData(action?: {
+  callback_data?: string;
+  value?: string | FeishuCardActionValue;
+}): string {
+  if (typeof action?.callback_data === 'string' && action.callback_data) {
+    return action.callback_data;
+  }
+  if (typeof action?.value === 'string' && action.value) {
+    return action.value;
+  }
+  if (action?.value && typeof action.value === 'object') {
+    return action.value.callback_data || action.value.callbackData || action.value.value || '';
+  }
+  return '';
+}
+
+export function buildPermissionCardActionResponse(callbackData: string): FeishuCardActionResponse {
+  const parts = callbackData.split(':');
+  const action = parts[1];
+
+  let resultText = '';
+  let resultEmoji = '';
+  let template = 'green';
+  if (action === 'allow') {
+    resultText = 'Permission Allowed';
+    resultEmoji = '✅';
+    template = 'green';
+  } else if (action === 'allow_session') {
+    resultText = 'Session Allowed';
+    resultEmoji = '🔓';
+    template = 'blue';
+  } else if (action === 'deny') {
+    resultText = 'Permission Denied';
+    resultEmoji = '❌';
+    template = 'red';
+  } else {
+    resultText = 'Permission Updated';
+    resultEmoji = '✅';
+  }
+
+  return {
+    toast: {
+      type: 'success',
+      content: resultText,
+    },
+    card: {
+      type: 'raw',
+      data: {
+        schema: '2.0',
+        config: { wide_screen_mode: true },
+        header: {
+          template,
+          title: { tag: 'plain_text', content: `${resultEmoji} ${resultText}` },
+        },
+        body: {
+          elements: [
+            {
+              tag: 'markdown',
+              content: `Your choice: **${resultText}**\n\nClaude will proceed accordingly.`,
+            },
+          ],
+        },
+      },
+    },
+  };
+}
+
 
 /** MIME type guesses by message_type. */
 const MIME_BY_TYPE: Record<string, string> = {
@@ -127,12 +224,19 @@ export class FeishuAdapter extends BaseChannelAdapter {
     this.running = true;
 
     // Create EventDispatcher and register event handlers.
-    // NOTE: card.action.trigger requires HTTP webhook (not supported via WSClient).
-    // Openclaw uses an HTTP server for card callbacks — CodePilot is a desktop app
-    // without a public endpoint, so we rely on text-based /perm commands instead.
+    // Card action button clicks are handled via WebSocket (im.message.card.action.trigger event).
     const dispatcher = new lark.EventDispatcher({}).register({
       'im.message.receive_v1': async (data) => {
         await this.handleIncomingEvent(data as FeishuMessageEventData);
+      },
+      'card.action.trigger': async (data: unknown) => {
+        return await this.handleCardActionEvent(data as Parameters<typeof this.handleCardActionEvent>[0]);
+      },
+      'im.message.card.action.trigger': async (data: unknown) => {
+        return await this.handleCardActionEvent(data as Parameters<typeof this.handleCardActionEvent>[0]);
+      },
+      'im.message.card.action.trigger_v1': async (data: unknown) => {
+        return await this.handleCardActionEvent(data as Parameters<typeof this.handleCardActionEvent>[0]);
       },
     });
 
@@ -358,11 +462,7 @@ export class FeishuAdapter extends BaseChannelAdapter {
 
   /**
    * Send a permission card with real Feishu card action buttons.
-   * Button clicks trigger card.action.trigger events handled by handleCardActionEvent().
-   * Feishu card action callbacks require HTTP webhook (not supported via WSClient).
-   * CodePilot is a desktop app without a public endpoint, so we send a
-   * well-formatted card with /perm text commands instead of clickable buttons.
-   * The user replies with the /perm command to approve/deny.
+   * Button clicks trigger im.message.card.action_v1 events handled by handleCardActionEvent().
    */
   private async sendPermissionCard(
     chatId: string,
@@ -373,31 +473,35 @@ export class FeishuAdapter extends BaseChannelAdapter {
       return { ok: false, error: 'Feishu client not initialized' };
     }
 
-    // Build /perm command lines from inline buttons
-    const permCommands = inlineButtons.flat().map((btn) => {
+    // Parse inline buttons for V2 card - buttons directly in body elements
+    const buttonElements = inlineButtons.flat().map((btn) => {
+      let action = btn.text;
+      let btnType = 'default';
+
       if (btn.callbackData.startsWith('perm:')) {
         const parts = btn.callbackData.split(':');
-        const action = parts[1];
-        const permId = parts.slice(2).join(':');
-        return `\`/perm ${action} ${permId}\``;
+        const permAction = parts[1];
+        if (permAction === 'allow') {
+          action = '✅ Allow';
+          btnType = 'primary';
+        } else if (permAction === 'allow_session') {
+          action = '🔓 Allow Session';
+          btnType = 'primary';
+        } else if (permAction === 'deny') {
+          action = '❌ Deny';
+          btnType = 'danger';
+        }
       }
-      return btn.text;
+
+      return {
+        tag: 'button',
+        text: { tag: 'plain_text', content: action },
+        type: btnType,
+        value: { callback_data: btn.callbackData },
+      };
     });
 
-    // Schema 2.0 card with markdown — permission info + shortcut/command options
-    const cardContent = [
-      text,
-      '',
-      '---',
-      '**Reply:**',
-      '`1` - Allow once',
-      '`2` - Allow session',
-      '`3` - Deny',
-      '',
-      'Or use full commands:',
-      ...permCommands,
-    ].join('\n');
-
+    // Use V2 card schema - buttons in body elements (vertical layout, fallback)
     const cardJson = JSON.stringify({
       schema: '2.0',
       config: { wide_screen_mode: true },
@@ -407,7 +511,16 @@ export class FeishuAdapter extends BaseChannelAdapter {
       },
       body: {
         elements: [
-          { tag: 'markdown', content: cardContent },
+          { tag: 'markdown', content: text },
+          { tag: 'div', text: { tag: 'plain_text', content: ' ' } },
+          ...buttonElements,
+          {
+            tag: 'div',
+            text: {
+              tag: 'plain_text',
+              content: 'Or reply with: 1 / 2 / 3, or use /perm allow | /perm allow_session | /perm deny',
+            },
+          },
         ],
       },
     });
@@ -429,7 +542,7 @@ export class FeishuAdapter extends BaseChannelAdapter {
       console.warn('[feishu-adapter] Permission card error:', err instanceof Error ? err.message : err);
     }
 
-    // Fallback: plain text
+    // Fallback: plain text with /perm commands
     const plainCommands = inlineButtons.flat().map((btn) => {
       if (btn.callbackData.startsWith('perm:')) {
         const parts = btn.callbackData.split(':');
@@ -454,6 +567,72 @@ export class FeishuAdapter extends BaseChannelAdapter {
       return { ok: false, error: res?.msg || 'Send failed' };
     } catch (err) {
       return { ok: false, error: err instanceof Error ? err.message : 'Send failed' };
+    }
+  }
+
+  // ── Card action event handler ─────────────────────────────────
+
+  /**
+   * Handle card button click events (im.message.card.action_v1).
+   * Parses the callback data and routes it through the permission broker.
+   */
+  private async handleCardActionEvent(data: {
+    message?: { message_id?: string; chat_id?: string };
+    context?: { open_message_id?: string; open_chat_id?: string };
+    operator?: { user_id?: { open_id?: string }; open_id?: string };
+    action?: { callback_data?: string; value?: string | FeishuCardActionValue };
+  }): Promise<FeishuCardActionResponse | void> {
+    const message = data.message;
+    const context = data.context;
+    const operator = data.operator;
+    const action = data.action;
+
+    console.log('[feishu-adapter] Card action raw data:', JSON.stringify(data));
+
+    const messageId = message?.message_id || context?.open_message_id || '';
+    const chatId = message?.chat_id || context?.open_chat_id || '';
+
+    if (!messageId || !chatId) {
+      console.warn('[feishu-adapter] Card action event missing message info');
+      return;
+    }
+
+    // Feishu may send callback data via action.callback_data, a legacy string value,
+    // or the recommended object-shaped action.value payload.
+    const callbackData = extractCardActionCallbackData(action);
+
+    if (!callbackData) {
+      console.warn('[feishu-adapter] Card action event missing callback_data, action:', JSON.stringify(action));
+      return;
+    }
+
+    // Only handle permission-related callbacks
+    if (!callbackData.startsWith('perm:')) {
+      console.log('[feishu-adapter] Ignoring non-permission card action:', callbackData);
+      return;
+    }
+
+    const userId = operator?.user_id?.open_id || operator?.open_id || '';
+
+    // Authorization check - verify user is allowed to interact
+    if (!this.isAuthorized(userId, chatId)) {
+      console.warn('[feishu-adapter] Unauthorized card action from userId:', userId, 'chatId:', chatId);
+      return;
+    }
+
+    console.log(`[feishu-adapter] Card action received: callbackData=${callbackData}, chatId=${chatId}, userId=${userId}, messageId=${messageId}`);
+
+    // Import permission broker dynamically to avoid circular deps
+    const { handlePermissionCallback } = await import('../permission-broker.js');
+
+    // Handle the permission callback (synchronous function)
+    const handled = handlePermissionCallback(callbackData, chatId, messageId);
+
+    if (handled) {
+      console.log(`[feishu-adapter] Permission callback handled: ${callbackData}`);
+      return buildPermissionCardActionResponse(callbackData);
+    } else {
+      console.warn(`[feishu-adapter] Permission callback not handled: ${callbackData}`);
     }
   }
 
