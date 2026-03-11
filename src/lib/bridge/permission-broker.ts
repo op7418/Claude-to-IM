@@ -59,9 +59,9 @@ export async function forwardPermissionRequest(
 
   let result: import('./types.js').SendResult;
 
-  if (adapter.channelType === 'qq') {
-    // QQ: plain text permission prompt with copyable /perm commands (no inline buttons)
-    const qqText = [
+  if (adapter.channelType === 'qq' || adapter.channelType === 'dingtalk') {
+    // QQ / DingTalk: plain text permission prompt with copyable /perm commands
+    const textPrompt = [
       `Permission Required`,
       ``,
       `Tool: ${toolName}`,
@@ -78,14 +78,14 @@ export async function forwardPermissionRequest(
       `/perm deny ${permissionRequestId}`,
     ].join('\n');
 
-    const qqMessage: OutboundMessage = {
+    const textMessage: OutboundMessage = {
       address,
-      text: qqText,
+      text: textPrompt,
       parseMode: 'plain',
       replyToMessageId,
     };
 
-    result = await deliver(adapter, qqMessage, { sessionId });
+    result = await deliver(adapter, textMessage, { sessionId });
   } else {
     const text = [
       `<b>Permission Required</b>`,
@@ -113,14 +113,19 @@ export async function forwardPermissionRequest(
     result = await deliver(adapter, message, { sessionId });
   }
 
-  // Record the link so we can match callback queries back to this permission
-  if (result.ok && result.messageId) {
+  // Record the link so we can match callback queries back to this permission.
+  // For text-command channels like QQ / DingTalk, webhook replies may not return
+  // a usable platform message ID. Numeric shortcuts and /perm commands only need
+  // the permission ID + chat ID, so persist a synthetic message ID instead of
+  // dropping the link entirely.
+  if (result.ok) {
     try {
+      const linkMessageId = result.messageId || `perm:${permissionRequestId}`;
       store.insertPermissionLink({
         permissionRequestId,
         channelType: adapter.channelType,
         chatId: address.chatId,
-        messageId: result.messageId,
+        messageId: linkMessageId,
         toolName,
         suggestions: suggestions ? JSON.stringify(suggestions) : '',
       });

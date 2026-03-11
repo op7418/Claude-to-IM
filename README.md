@@ -2,7 +2,7 @@
 
 English | [中文](README.zh-CN.md)
 
-Claude-to-IM is a host-agnostic bridge library that connects [Claude Code SDK](https://docs.anthropic.com/en/docs/claude-code/sdk) to IM platforms, allowing users to interact with Claude through Telegram, Discord, and Feishu (Lark).
+Claude-to-IM is a host-agnostic bridge library that connects [Claude Code SDK](https://docs.anthropic.com/en/docs/claude-code/sdk) to IM platforms, allowing users to interact with Claude through Telegram, Discord, Feishu (Lark), and DingTalk.
 
 This library handles all IM-side complexity — message routing, streaming previews, permission approval flows, Markdown rendering, chunking, retry, rate limiting — while delegating persistence, LLM calls, and permission resolution to the host application through a set of dependency injection interfaces.
 
@@ -14,11 +14,11 @@ Claude-to-IM was extracted from CodePilot as a standalone library for developers
 
 ## Features
 
-- **Multi-platform adapters**: Telegram (long polling), Discord (Gateway WebSocket), Feishu/Lark (WSClient)
+- **Multi-platform adapters**: Telegram (long polling), Discord (Gateway WebSocket), Feishu/Lark (WSClient), DingTalk (Stream Mode WebSocket)
 - **Streaming previews**: Real-time response drafts via message editing, with per-platform throttling
 - **Permission management**: Interactive inline buttons for Claude Code tool approvals (allow / deny / allow for session)
 - **Session binding**: Each IM chat maps to a persistent conversation session with working directory and model settings
-- **Markdown rendering**: Platform-native formatting — HTML for Telegram, Discord-flavored Markdown, Feishu rich text cards
+- **Markdown rendering**: Platform-native formatting — HTML for Telegram, Discord-flavored Markdown, Feishu rich text cards, DingTalk markdown replies
 - **Reliable delivery**: Auto-chunking at platform limits, retry with exponential backoff, HTML fallback on parse errors, message deduplication
 - **Security**: Input validation, token bucket rate limiting (20 msg/min per chat), user authorization whitelists, full audit logging
 - **Host-agnostic**: All host dependencies abstracted via 4 DI interfaces — no database driver, no LLM client, no framework lock-in
@@ -26,7 +26,7 @@ Claude-to-IM was extracted from CodePilot as a standalone library for developers
 ## Architecture
 
 ```
-IM Platform (Telegram / Discord / Feishu)
+IM Platform (Telegram / Discord / Feishu / DingTalk)
         |
         | InboundMessage
         v
@@ -99,6 +99,17 @@ A self-contained example with in-memory store and echo LLM is included:
 npx tsx src/lib/bridge/examples/mock-host.ts
 ```
 
+To test the DingTalk Stream demo:
+
+```bash
+DINGTALK_CLIENT_ID=dingxxxx \
+DINGTALK_CLIENT_SECRET=xxxx \
+DINGTALK_ALLOWED_USERS="*" \
+npm run example:dingtalk
+```
+
+Set `DINGTALK_DEBUG=true` if you want inbound / outbound adapter logs in the console.
+
 ## Configuration
 
 All settings are read through `BridgeStore.getSetting(key)`. Your host application decides how to store and surface these values (database, env vars, config file, UI settings panel, etc.).
@@ -108,8 +119,14 @@ All settings are read through `BridgeStore.getSetting(key)`. Your host applicati
 | Key | Description |
 |-----|-------------|
 | `remote_bridge_enabled` | Master switch — `"true"` to enable the bridge |
-| `bridge_{adapter}_bot_token` | Bot token for the platform (e.g. `bridge_telegram_bot_token`) |
 | `bridge_{adapter}_allowed_users` | Comma-separated user IDs authorized to use the bridge |
+
+Platform-specific credentials:
+
+- `bridge_telegram_bot_token`
+- `bridge_discord_bot_token`
+- `bridge_feishu_app_id` + `bridge_feishu_app_secret`
+- `bridge_dingtalk_client_id` + `bridge_dingtalk_client_secret`
 
 ### Optional Settings
 
@@ -121,7 +138,7 @@ All settings are read through `BridgeStore.getSetting(key)`. Your host applicati
 | `bridge_default_cwd` | Default working directory for new sessions | `$HOME` |
 | `bridge_model` | Default Claude model | Host decides |
 
-Replace `{adapter}` with `telegram`, `discord`, or `feishu`.
+Replace `{adapter}` with `telegram`, `discord`, `feishu`, or `dingtalk`.
 
 ## Limitations
 
@@ -154,6 +171,7 @@ You still need to create bots on each platform and obtain tokens:
 - **Telegram**: Create a bot via [@BotFather](https://t.me/BotFather)
 - **Discord**: Create an application in the [Developer Portal](https://discord.com/developers/applications) with Message Content Intent enabled
 - **Feishu**: Create an app in the [Developer Console](https://open.feishu.cn/app) with IM permissions
+- **DingTalk**: Create an internal app in the [DingTalk Developer Console](https://open.dingtalk.com/), enable the bot capability, and use Stream Mode with `bridge_dingtalk_client_id` / `bridge_dingtalk_client_secret`
 
 ## Documentation
 
@@ -183,6 +201,7 @@ src/
       telegram-adapter.ts   # Telegram Bot API long polling
       discord-adapter.ts    # Discord.js Gateway WebSocket
       feishu-adapter.ts     # Feishu/Lark WSClient
+      dingtalk-adapter.ts   # DingTalk Stream Mode WebSocket
       telegram-media.ts     # Telegram file download/attachment handling
       telegram-utils.ts     # Telegram API helpers
       index.ts              # Side-effect imports for adapter self-registration
@@ -192,11 +211,14 @@ src/
       telegram.ts           # Markdown -> Telegram HTML
       discord.ts            # Markdown -> Discord-flavored Markdown
       feishu.ts             # Markdown -> Feishu rich text / cards
+      dingtalk.ts           # Markdown normalization for DingTalk
     security/
       validators.ts         # Input validation (path traversal, injection, sanitization)
       rate-limiter.ts       # Token bucket rate limiter (per chat)
     examples/
       mock-host.ts          # Runnable example with InMemoryStore + EchoLLM
+      dingtalk-stream-demo.ts # Runnable DingTalk Stream demo
+      example-support.ts    # Shared InMemoryStore / EchoLLM helpers for examples
   __tests__/unit/
     bridge-channel-router.test.ts
     bridge-delivery-layer.test.ts

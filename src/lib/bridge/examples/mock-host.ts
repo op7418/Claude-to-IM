@@ -18,106 +18,7 @@
 import { initBridgeContext } from '../context.js';
 import * as router from '../channel-router.js';
 import * as engine from '../conversation-engine.js';
-import type {
-  BridgeStore,
-  LLMProvider,
-  PermissionGateway,
-  LifecycleHooks,
-  StreamChatParams,
-  BridgeSession,
-  BridgeMessage,
-} from '../host.js';
-import type { ChannelBinding, ChannelType } from '../types.js';
-
-// ── In-memory Store ─────────────────────────────────────────
-
-class InMemoryStore implements BridgeStore {
-  private settings = new Map<string, string>();
-  private sessions = new Map<string, BridgeSession>();
-  private bindings = new Map<string, ChannelBinding>();
-  private messages = new Map<string, BridgeMessage[]>();
-  private nextId = 1;
-
-  getSetting(key: string) { return this.settings.get(key) ?? null; }
-
-  getChannelBinding(channelType: string, chatId: string) {
-    return this.bindings.get(`${channelType}:${chatId}`) ?? null;
-  }
-
-  upsertChannelBinding(data: { channelType: string; chatId: string; codepilotSessionId: string; workingDirectory: string; model: string }) {
-    const id = `binding-${this.nextId++}`;
-    const binding: ChannelBinding = {
-      id, ...data, sdkSessionId: '', mode: 'code', active: true,
-      createdAt: new Date().toISOString(), updatedAt: new Date().toISOString(),
-    };
-    this.bindings.set(`${data.channelType}:${data.chatId}`, binding);
-    return binding;
-  }
-
-  updateChannelBinding(id: string, updates: Partial<ChannelBinding>) {
-    for (const [key, b] of this.bindings) {
-      if (b.id === id) { this.bindings.set(key, { ...b, ...updates }); break; }
-    }
-  }
-
-  listChannelBindings(_channelType?: ChannelType) { return Array.from(this.bindings.values()); }
-
-  getSession(id: string) { return this.sessions.get(id) ?? null; }
-
-  createSession(name: string, model: string, _sp?: string, cwd?: string) {
-    const session: BridgeSession = { id: `session-${this.nextId++}`, working_directory: cwd || '/tmp', model };
-    this.sessions.set(session.id, session);
-    return session;
-  }
-
-  updateSessionProviderId() {}
-  addMessage(sessionId: string, role: string, content: string) {
-    const msgs = this.messages.get(sessionId) || [];
-    msgs.push({ role, content });
-    this.messages.set(sessionId, msgs);
-  }
-  getMessages(sessionId: string) { return { messages: this.messages.get(sessionId) || [] }; }
-  acquireSessionLock() { return true; }
-  renewSessionLock() {}
-  releaseSessionLock() {}
-  setSessionRuntimeStatus() {}
-  updateSdkSessionId() {}
-  updateSessionModel() {}
-  syncSdkTasks() {}
-  getProvider() { return undefined; }
-  getDefaultProviderId() { return null; }
-  insertAuditLog() {}
-  checkDedup() { return false; }
-  insertDedup() {}
-  cleanupExpiredDedup() {}
-  insertOutboundRef() {}
-  insertPermissionLink() {}
-  getPermissionLink() { return null; }
-  markPermissionLinkResolved() { return false; }
-  listPendingPermissionLinksByChat() { return []; }
-  getChannelOffset() { return '0'; }
-  setChannelOffset() {}
-}
-
-// ── Echo LLM (returns user input as response) ───────────────
-
-class EchoLLM implements LLMProvider {
-  streamChat(params: StreamChatParams): ReadableStream<string> {
-    const response = `Echo: ${params.prompt}`;
-    return new ReadableStream({
-      start(controller) {
-        // Emit text event
-        controller.enqueue(`data: ${JSON.stringify({ type: 'text', data: response })}\n`);
-        // Emit result event
-        controller.enqueue(`data: ${JSON.stringify({
-          type: 'result',
-          data: JSON.stringify({ usage: { input_tokens: 10, output_tokens: 5 } }),
-        })}\n`);
-        controller.close();
-      },
-    });
-  }
-}
+import { EchoLLM, InMemoryStore, allowAllPermissions, logLifecycle } from './example-support.js';
 
 // ── Main ────────────────────────────────────────────────────
 
@@ -128,11 +29,8 @@ async function main() {
   initBridgeContext({
     store: new InMemoryStore(),
     llm: new EchoLLM(),
-    permissions: { resolvePendingPermission: () => true },
-    lifecycle: {
-      onBridgeStart: () => console.log('[lifecycle] Bridge started'),
-      onBridgeStop: () => console.log('[lifecycle] Bridge stopped'),
-    },
+    permissions: allowAllPermissions,
+    lifecycle: logLifecycle,
   });
 
   // 2. Simulate an inbound message

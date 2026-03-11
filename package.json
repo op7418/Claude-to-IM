@@ -27,26 +27,31 @@
       "import": "./dist/lib/bridge/security/*.js"
     }
   },
-  "files": ["dist", "src/lib"],
+  "files": [
+    "dist",
+    "src/lib"
+  ],
   "scripts": {
     "build": "tsc -p tsconfig.build.json",
     "prepare": "npm run build",
     "typecheck": "tsc --noEmit",
     "test:unit": "node --test --import tsx --test-timeout=15000 src/__tests__/unit/bridge-*.test.ts",
     "test": "npm run typecheck && npm run test:unit",
-    "example": "npx tsx src/lib/bridge/examples/mock-host.ts"
+    "example": "npx tsx src/lib/bridge/examples/mock-host.ts",
+    "example:dingtalk": "npx tsx src/lib/bridge/examples/dingtalk-stream-demo.ts"
   },
   "dependencies": {
     "@anthropic-ai/claude-agent-sdk": "^0.2.62",
     "@larksuiteoapi/node-sdk": "^1.59.0",
+    "dingtalk-stream": "^2.1.4",
     "discord.js": "^14.25.1",
     "markdown-it": "^14.1.1",
     "ws": "^8.18.0"
   },
   "devDependencies": {
     "@types/markdown-it": "^14.1.2",
-    "@types/ws": "^8.5.0",
     "@types/node": "^22.0.0",
+    "@types/ws": "^8.5.0",
     "tsx": "^4.21.0",
     "typescript": "^5"
   },
