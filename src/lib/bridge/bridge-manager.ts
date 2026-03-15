@@ -548,9 +548,14 @@ async function handleMessage(
 
   // Check for IM commands (before sanitization — commands are validated individually)
   if (rawText.startsWith('/')) {
-    await handleCommand(adapter, msg, rawText);
-    ack();
-    return;
+    const handled = await handleCommand(adapter, msg, rawText);
+    if (handled) {
+      ack();
+      return;
+    }
+    // Unrecognized slash commands fall through as regular messages to the LLM.
+    // This allows Claude Code commands (/model, /compact, /clear, /doctor)
+    // and skill invocations to pass through.
   }
 
   // Sanitize general message text before routing to conversation engine
@@ -757,12 +762,14 @@ async function handleMessage(
 
 /**
  * Handle IM slash commands.
+ * Returns true if the command was handled, false if it should be
+ * forwarded to the LLM as a regular message.
  */
 async function handleCommand(
   adapter: BaseChannelAdapter,
   msg: InboundMessage,
   text: string,
-): Promise<void> {
+): Promise<boolean> {
   const { store } = getBridgeContext();
 
   // Extract command and args (handle /command@botname format)
@@ -804,6 +811,7 @@ async function handleCommand(
         '/bind &lt;session_id&gt; - Bind to existing session',
         '/cwd /path - Change working directory',
         '/mode plan|code|ask - Change mode',
+        '/model <name> - Switch model',
         '/status - Show current status',
         '/sessions - List recent sessions',
         '/stop - Stop current session',
@@ -881,6 +889,18 @@ async function handleCommand(
       break;
     }
 
+    case '/model': {
+      if (!args) {
+        const binding = router.resolve(msg.address);
+        response = `Current model: <code>${binding.model || 'default'}</code>\nUsage: /model <name> (e.g. /model claude-sonnet-4-20250514)`;
+        break;
+      }
+      const binding = router.resolve(msg.address);
+      router.updateBinding(binding.id, { model: args });
+      response = `Model set to <code>${escapeHtml(args)}</code>`;
+      break;
+    }
+
     case '/status': {
       const binding = router.resolve(msg.address);
       response = [
@@ -952,6 +972,7 @@ async function handleCommand(
         '/cwd /path - Change working directory',
         '/mode plan|code|ask - Change mode',
         '/status - Show current status',
+        '/model <name> - Switch model',
         '/sessions - List recent sessions',
         '/stop - Stop current session',
         '/perm allow|allow_session|deny &lt;id&gt; - Respond to permission request',
@@ -961,7 +982,8 @@ async function handleCommand(
       break;
 
     default:
-      response = `Unknown command: ${escapeHtml(command)}\nType /help for available commands.`;
+      // Unrecognized — let caller forward as regular message to LLM
+      return false;
   }
 
   if (response) {
@@ -972,6 +994,7 @@ async function handleCommand(
       replyToMessageId: msg.messageId,
     });
   }
+  return true;
 }
 
 // ── SDK Session Update Logic ─────────────────────────────────
