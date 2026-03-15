@@ -77,6 +77,23 @@ function isNumericPermissionShortcut(channelType: string, rawText: string, chatI
   return pending.length > 0; // any pending → route to inline path
 }
 
+/** Known bridge slash commands. Anything else starting with "/" is treated as normal text. */
+const KNOWN_COMMANDS = new Set([
+  '/start', '/new', '/bind', '/cwd', '/mode',
+  '/status', '/sessions', '/stop', '/perm', '/help',
+]);
+
+/**
+ * Check if a raw message text starts with a known bridge command.
+ * Handles /command@botname format by stripping the @mention suffix.
+ * Non-matching slash-prefixed text (e.g. file paths like "/Users/foo")
+ * is forwarded to the conversation engine instead of rejected.
+ */
+function isKnownCommand(rawText: string): boolean {
+  const firstWord = rawText.split(/\s+/)[0].split('@')[0].toLowerCase();
+  return KNOWN_COMMANDS.has(firstWord);
+}
+
 /** Fire-and-forget: send a preview draft. Only degrades on permanent failure. */
 function flushPreview(
   adapter: BaseChannelAdapter,
@@ -394,7 +411,7 @@ function runAdapterLoop(adapter: BaseChannelAdapter): void {
         // deadlocks (permission waits for "1", "1" waits for lock release).
         if (
           msg.callbackData ||
-          msg.text.trim().startsWith('/') ||
+          (msg.text.trim().startsWith('/') && isKnownCommand(msg.text.trim())) ||
           isNumericPermissionShortcut(adapter.channelType, msg.text.trim(), msg.address.chatId)
         ) {
           await handleMessage(adapter, msg);
@@ -546,12 +563,18 @@ async function handleMessage(
     }
   }
 
-  // Check for IM commands (before sanitization — commands are validated individually)
-  if (rawText.startsWith('/')) {
+  // Check for IM commands (before sanitization — commands are validated individually).
+  // Only intercept known bridge commands — other slash-prefixed text (e.g. file
+  // paths like "/Users/justin/...") should be forwarded to the conversation engine.
+  if (rawText.startsWith('/') && isKnownCommand(rawText)) {
     await handleCommand(adapter, msg, rawText);
     ack();
     return;
   }
+
+  // If the message starts with "/" but is NOT a known command, strip the
+  // command-routing flag so it flows into the conversation engine normally.
+  // (This handles file paths like "/Users/foo/bar" sent from IM.)
 
   // Sanitize general message text before routing to conversation engine
   const { text, truncated } = sanitizeInput(rawText);
