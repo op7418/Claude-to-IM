@@ -12,7 +12,7 @@ import * as path from 'path';
 const MAX_INPUT_LENGTH = 32_000; // Claude's effective context limit
 const MAX_PATH_LENGTH = 1024;
 const SESSION_ID_PATTERN = /^[0-9a-f-]{32,64}$/i;
-const VALID_MODES = ['plan', 'code', 'ask'] as const;
+const VALID_MODES = ['plan', 'code', 'ask', 'bypass'] as const;
 
 /**
  * Patterns that indicate shell injection or dangerous input.
@@ -122,6 +122,6 @@ export function sanitizeInput(
 /**
  * Validate /mode parameter.
  */
-export function validateMode(mode: string): mode is 'plan' | 'code' | 'ask' {
+export function validateMode(mode: string): mode is 'plan' | 'code' | 'ask' | 'bypass' {
   return VALID_MODES.includes(mode as typeof VALID_MODES[number]);
 }
