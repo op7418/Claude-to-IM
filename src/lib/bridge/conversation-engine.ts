@@ -145,6 +145,7 @@ export async function processMessage(
     switch (binding.mode) {
       case 'plan': permissionMode = 'plan'; break;
       case 'ask': permissionMode = 'default'; break;
+      case 'bypass': permissionMode = 'bypassPermissions'; break;
       default: permissionMode = 'acceptEdits'; break;
     }
 
