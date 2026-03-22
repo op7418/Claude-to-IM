@@ -23,8 +23,7 @@ import type { FileAttachment } from '../types.js';
 import { BaseChannelAdapter, registerAdapterFactory } from '../channel-adapter.js';
 import { getBridgeContext } from '../context.js';
 
-/** Max number of message IDs to keep for dedup. */
-const DEDUP_MAX = 1000;
+
 
 /** Discord message character limit. */
 const DISCORD_CHAR_LIMIT = 2000;
@@ -60,7 +59,7 @@ export class DiscordAdapter extends BaseChannelAdapter {
   private client: any = null;
   private queue: InboundMessage[] = [];
   private waiters: Array<(msg: InboundMessage | null) => void> = [];
-  private seenMessageIds = new Set<string>();
+  // Inbound dedup now uses persistent store (survives process restarts)
   private botUserId: string | null = null;
   private typingIntervals = new Map<string, ReturnType<typeof setInterval>>();
   /** Temporary storage for Interaction objects (for answerCallback). */
@@ -158,7 +157,6 @@ export class DiscordAdapter extends BaseChannelAdapter {
     this.typingIntervals.clear();
 
     // Clear state
-    this.seenMessageIds.clear();
     this.pendingInteractions.clear();
     this.previewMessages.clear();
     this.previewDegraded.clear();
@@ -421,9 +419,10 @@ export class DiscordAdapter extends BaseChannelAdapter {
     if (message.author.bot) return;
     if (this.botUserId && message.author.id === this.botUserId) return;
 
-    // Dedup by message ID
-    if (this.seenMessageIds.has(message.id)) return;
-    this.addToDedup(message.id);
+    // Dedup by message ID — persistent via store (survives process restarts)
+    const store = getBridgeContext().store;
+    if (store.checkDedup(message.id)) return;
+    store.insertDedup(message.id);
 
     const chatId = message.channelId;
     const userId = message.author.id;
@@ -615,19 +614,7 @@ export class DiscordAdapter extends BaseChannelAdapter {
 
   // ── Utilities ───────────────────────────────────────────────
 
-  private addToDedup(messageId: string): void {
-    this.seenMessageIds.add(messageId);
-
-    if (this.seenMessageIds.size > DEDUP_MAX) {
-      const excess = this.seenMessageIds.size - DEDUP_MAX;
-      let removed = 0;
-      for (const id of this.seenMessageIds) {
-        if (removed >= excess) break;
-        this.seenMessageIds.delete(id);
-        removed++;
-      }
-    }
-  }
+  // addToDedup removed — now using persistent store.insertDedup()
 
   private cleanupExpiredInteractions(): void {
     const now = Date.now();
