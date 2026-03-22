@@ -13,3 +13,4 @@ import './telegram-adapter.js';
 import './feishu-adapter.js';
 import './discord-adapter.js';
 import './qq-adapter.js';
+import './wechat-adapter.js';

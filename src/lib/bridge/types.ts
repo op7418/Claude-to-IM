@@ -185,4 +185,5 @@ export const PLATFORM_LIMITS: Record<string, number> = {
   slack: 40000,
   feishu: 30000,
   qq: 2000,
+  wechat: 4096,
 };

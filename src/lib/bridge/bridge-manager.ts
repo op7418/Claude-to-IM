@@ -69,7 +69,7 @@ function getStreamConfig(channelType = 'telegram'): StreamConfig {
  * session lock would deadlock.
  */
 function isNumericPermissionShortcut(channelType: string, rawText: string, chatId: string): boolean {
-  if (channelType !== 'feishu' && channelType !== 'qq') return false;
+  if (channelType !== 'feishu' && channelType !== 'qq' && channelType !== 'wechat') return false;
   const normalized = rawText.normalize('NFKC').replace(/[\u200B-\u200D\uFEFF]/g, '').trim();
   if (!/^[123]$/.test(normalized)) return false;
   const { store } = getBridgeContext();
@@ -497,7 +497,7 @@ async function handleMessage(
   // Input normalization: mobile keyboards / IM clients may send fullwidth
   // digits (１２３), digits with zero-width joiners, or other Unicode
   // variants. NFKC normalization folds them all to ASCII 1/2/3.
-  if (adapter.channelType === 'feishu' || adapter.channelType === 'qq') {
+  if (adapter.channelType === 'feishu' || adapter.channelType === 'qq' || adapter.channelType === 'wechat') {
     // eslint-disable-next-line no-control-regex
     const normalized = rawText.normalize('NFKC').replace(/[\u200B-\u200D\uFEFF]/g, '').trim();
     if (/^[123]$/.test(normalized)) {
