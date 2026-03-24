@@ -61,7 +61,7 @@ function getStreamConfig(channelType = 'telegram'): StreamConfig {
 
 /**
  * Check if a message looks like a numeric permission shortcut (1/2/3) for
- * feishu/qq channels WITH at least one pending permission in that chat.
+ * feishu/qq/dingtalk channels WITH at least one pending permission in that chat.
  *
  * This is used by the adapter loop to route these messages to the inline
  * (non-session-locked) path, avoiding deadlock: the session is blocked
@@ -69,7 +69,7 @@ function getStreamConfig(channelType = 'telegram'): StreamConfig {
  * session lock would deadlock.
  */
 function isNumericPermissionShortcut(channelType: string, rawText: string, chatId: string): boolean {
-  if (channelType !== 'feishu' && channelType !== 'qq' && channelType !== 'weixin') return false;
+  if (channelType !== 'feishu' && channelType !== 'qq' && channelType !== 'weixin' && channelType !== 'dingtalk') return false;
   const normalized = rawText.normalize('NFKC').replace(/[\u200B-\u200D\uFEFF]/g, '').trim();
   if (!/^[123]$/.test(normalized)) return false;
   const { store } = getBridgeContext();
@@ -139,6 +139,14 @@ async function deliverResponse(
   }
   if (adapter.channelType === 'feishu') {
     // Feishu: pass markdown through for adapter to format as post/card
+    return deliver(adapter, {
+      address,
+      text: responseText,
+      parseMode: 'Markdown',
+      replyToMessageId,
+    }, { sessionId });
+  }
+  if (adapter.channelType === 'dingtalk') {
     return deliver(adapter, {
       address,
       text: responseText,
@@ -388,7 +396,7 @@ function runAdapterLoop(adapter: BaseChannelAdapter): void {
         // lightweight — process inline (outside session lock).
         // Regular messages use per-session locking for concurrency.
         //
-        // IMPORTANT: numeric shortcuts (1/2/3) for feishu/qq MUST run outside
+        // IMPORTANT: numeric shortcuts (1/2/3) for feishu/qq/dingtalk MUST run outside
         // the session lock. The current session is blocked waiting for the
         // permission to be resolved; if "1" enters the session lock queue it
         // deadlocks (permission waits for "1", "1" waits for lock release).
@@ -503,7 +511,7 @@ async function handleMessage(
     return;
   }
 
-  // ── Numeric shortcut for permission replies (feishu/qq/weixin only) ──
+  // ── Numeric shortcut for permission replies (feishu/qq/weixin/dingtalk only) ──
   // On mobile, typing `/perm allow <uuid>` is painful.
   // If the user sends "1", "2", or "3" and there is exactly one pending
   // permission for this chat, map it: 1→allow, 2→allow_session, 3→deny.
@@ -515,6 +523,7 @@ async function handleMessage(
     adapter.channelType === 'feishu'
     || adapter.channelType === 'qq'
     || adapter.channelType === 'weixin'
+    || adapter.channelType === 'dingtalk'
   ) {
     // eslint-disable-next-line no-control-regex
     const normalized = rawText.normalize('NFKC').replace(/[\u200B-\u200D\uFEFF]/g, '').trim();
@@ -973,7 +982,7 @@ async function handleCommand(
         '/sessions - List recent sessions',
         '/stop - Stop current session',
         '/perm allow|allow_session|deny &lt;id&gt; - Respond to permission request',
-        '1/2/3 - Quick permission reply (Feishu/QQ/WeChat, single pending)',
+        '1/2/3 - Quick permission reply (Feishu/QQ/WeChat/DingTalk, single pending)',
         '/help - Show this help',
       ].join('\n');
       break;
