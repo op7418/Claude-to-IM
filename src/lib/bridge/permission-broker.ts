@@ -59,9 +59,10 @@ export async function forwardPermissionRequest(
 
   let result: import('./types.js').SendResult;
 
-  if (adapter.channelType === 'qq' || adapter.channelType === 'dingtalk') {
-    // QQ / DingTalk: plain text permission prompt with copyable /perm commands
-    const textPrompt = [
+  if (adapter.channelType === 'qq' || adapter.channelType === 'weixin' || adapter.channelType === 'dingtalk') {
+    const channelLabel = adapter.channelType === 'weixin' ? 'WeChat' : 'QQ';
+    // QQ / WeChat: plain text permission prompt with copyable /perm commands (no inline buttons)
+    const plainText = [
       `Permission Required`,
       ``,
       `Tool: ${toolName}`,
@@ -78,14 +79,17 @@ export async function forwardPermissionRequest(
       `/perm deny ${permissionRequestId}`,
     ].join('\n');
 
-    const textMessage: OutboundMessage = {
+    const plainMessage: OutboundMessage = {
       address,
-      text: textPrompt,
+      text: plainText,
       parseMode: 'plain',
       replyToMessageId,
     };
 
-    result = await deliver(adapter, textMessage, { sessionId });
+    result = await deliver(adapter, plainMessage, { sessionId });
+    console.log(
+      `[permission-broker] Sent plain-text permission prompt for ${channelLabel}: ${permissionRequestId}`,
+    );
   } else {
     const text = [
       `<b>Permission Required</b>`,

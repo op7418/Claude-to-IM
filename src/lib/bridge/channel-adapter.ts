@@ -96,6 +96,26 @@ export abstract class BaseChannelAdapter {
    * normal delivery path, so this is typically a no-op.
    */
   endPreview?(_chatId: string, _draftId: number): void;
+
+  /**
+   * Called on each text SSE event during streaming. Adapter can use this
+   * to update a streaming card in real-time. Only called for adapters
+   * that support streaming cards (e.g. Feishu CardKit v2).
+   */
+  onStreamText?(_chatId: string, _fullText: string): void;
+
+  /**
+   * Called when tool_use / tool_result events arrive during streaming.
+   * Adapter can use this to display tool progress in the streaming card.
+   */
+  onToolEvent?(_chatId: string, _tools: import('./types.js').ToolCallInfo[]): void;
+
+  /**
+   * Called when streaming ends. Adapter should finalize the streaming card
+   * (close streaming mode, add footer, etc.).
+   * Returns true if a card was finalized (caller should skip normal delivery).
+   */
+  onStreamEnd?(_chatId: string, _status: 'completed' | 'interrupted' | 'error', _responseText: string): Promise<boolean>;
 }
 
 // ── Adapter Registry ────────────────────────────────────────────

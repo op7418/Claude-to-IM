@@ -167,6 +167,15 @@ export interface StreamingPreviewState {
   pendingText: string;       // latest accumulated text (may not yet be sent due to throttle)
 }
 
+// ── Tool Call Info ─────────────────────────────────────────────
+
+/** Tool call tracking for streaming card progress display */
+export interface ToolCallInfo {
+  id: string;
+  name: string;
+  status: 'running' | 'complete' | 'error';
+}
+
 // ── Config ─────────────────────────────────────────────────────
 
 /** Platform-specific message length limits */
@@ -177,4 +186,5 @@ export const PLATFORM_LIMITS: Record<string, number> = {
   slack: 40000,
   feishu: 30000,
   qq: 2000,
+  weixin: 4000,
 };

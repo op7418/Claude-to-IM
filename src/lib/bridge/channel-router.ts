@@ -57,8 +57,10 @@ export function createBinding(
     channelType: address.channelType,
     chatId: address.chatId,
     codepilotSessionId: session.id,
+    sdkSessionId: '',
     workingDirectory: defaultCwd,
     model: defaultModel,
+    mode: 'code',
   });
 }
 

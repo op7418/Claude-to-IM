@@ -24,6 +24,7 @@ import type {
   SendResult,
 } from '../types.js';
 import type { FileAttachment } from '../types.js';
+import type { ToolCallInfo } from '../types.js';
 import { BaseChannelAdapter, registerAdapterFactory } from '../channel-adapter.js';
 import { getBridgeContext } from '../context.js';
 import {
@@ -32,6 +33,10 @@ import {
   hasComplexMarkdown,
   buildCardContent,
   buildPostContent,
+  buildStreamingContent,
+  buildFinalCardJson,
+  buildPermissionButtonCard,
+  formatElapsed,
 } from '../markdown/feishu.js';
 
 /** Max number of message_ids to keep for dedup. */
@@ -42,6 +47,22 @@ const MAX_FILE_SIZE = 20 * 1024 * 1024;
 
 /** Feishu emoji type for typing indicator (same as Openclaw). */
 const TYPING_EMOJI = 'Typing';
+
+/** State for an active CardKit v2 streaming card. */
+interface FeishuCardState {
+  cardId: string;
+  messageId: string;
+  sequence: number;
+  startTime: number;
+  toolCalls: ToolCallInfo[];
+  thinking: boolean;
+  pendingText: string | null;
+  lastUpdateAt: number;
+  throttleTimer: ReturnType<typeof setTimeout> | null;
+}
+
+/** Streaming card throttle interval (ms). */
+const CARD_THROTTLE_MS = 200;
 
 /** Shape of the SDK's im.message.receive_v1 event data. */
 type FeishuMessageEventData = {
@@ -95,6 +116,10 @@ export class FeishuAdapter extends BaseChannelAdapter {
   private lastIncomingMessageId = new Map<string, string>();
   /** Track active typing reaction IDs per chat for cleanup. */
   private typingReactions = new Map<string, string>();
+  /** Active streaming card state per chatId. */
+  private activeCards = new Map<string, FeishuCardState>();
+  /** In-flight card creation promises per chatId — prevents duplicate creation. */
+  private cardCreatePromises = new Map<string, Promise<boolean>>();
 
   // ── Lifecycle ───────────────────────────────────────────────
 
@@ -127,13 +152,13 @@ export class FeishuAdapter extends BaseChannelAdapter {
     this.running = true;
 
     // Create EventDispatcher and register event handlers.
-    // NOTE: card.action.trigger requires HTTP webhook (not supported via WSClient).
-    // Openclaw uses an HTTP server for card callbacks — CodePilot is a desktop app
-    // without a public endpoint, so we rely on text-based /perm commands instead.
     const dispatcher = new lark.EventDispatcher({}).register({
       'im.message.receive_v1': async (data) => {
         await this.handleIncomingEvent(data as FeishuMessageEventData);
       },
+      'card.action.trigger': (async (data: unknown) => {
+        return await this.handleCardAction(data);
+      }) as any,
     });
 
     // Create and start WSClient
@@ -142,6 +167,29 @@ export class FeishuAdapter extends BaseChannelAdapter {
       appSecret,
       domain,
     });
+
+    // Monkey-patch WSClient.handleEventData to support card action events (type: "card").
+    // The SDK's WSClient only processes type="event" messages. Card action callbacks
+    // arrive as type="card" and would be silently dropped without this patch.
+    const wsClientAny = this.wsClient as any;
+    if (typeof wsClientAny.handleEventData === 'function') {
+      const origHandleEventData = wsClientAny.handleEventData.bind(wsClientAny);
+      wsClientAny.handleEventData = (data: any) => {
+        const msgType = data.headers?.find?.((h: any) => h.key === 'type')?.value;
+        if (msgType === 'card') {
+          console.log('[feishu-adapter] handleEventData type: card (patched → event)');
+          const patchedData = {
+            ...data,
+            headers: data.headers.map((h: any) =>
+              h.key === 'type' ? { ...h, value: 'event' } : h,
+            ),
+          };
+          return origHandleEventData(patchedData);
+        }
+        return origHandleEventData(data);
+      };
+    }
+
     this.wsClient.start({ eventDispatcher: dispatcher });
 
     console.log('[feishu-adapter] Started (botOpenId:', this.botOpenId || 'unknown', ')');
@@ -167,6 +215,13 @@ export class FeishuAdapter extends BaseChannelAdapter {
       waiter(null);
     }
     this.waiters = [];
+
+    // Clean up active cards
+    for (const [, state] of this.activeCards) {
+      if (state.throttleTimer) clearTimeout(state.throttleTimer);
+    }
+    this.activeCards.clear();
+    this.cardCreatePromises.clear();
 
     // Clear state
     this.seenMessageIds.clear();
@@ -205,25 +260,28 @@ export class FeishuAdapter extends BaseChannelAdapter {
   // ── Typing indicator (Openclaw-style reaction) ─────────────
 
   /**
-   * Add a "Typing" emoji reaction to the user's message.
+   * Add a "Typing" emoji reaction to the user's message and create streaming card.
    * Called by bridge-manager via onMessageStart().
    */
   onMessageStart(chatId: string): void {
     const messageId = this.lastIncomingMessageId.get(chatId);
-    if (!messageId || !this.restClient) return;
 
-    // Fire-and-forget — typing indicator is non-critical
+    // Create streaming card (fire-and-forget — fallback to traditional if fails)
+    if (messageId) {
+      this.createStreamingCard(chatId, messageId).catch(() => {});
+    }
+
+    // Typing indicator (same as before)
+    if (!messageId || !this.restClient) return;
     this.restClient.im.messageReaction.create({
       path: { message_id: messageId },
       data: { reaction_type: { emoji_type: TYPING_EMOJI } },
     }).then((res) => {
-      // eslint-disable-next-line @typescript-eslint/no-explicit-any
       const reactionId = (res as any)?.data?.reaction_id;
       if (reactionId) {
         this.typingReactions.set(chatId, reactionId);
       }
     }).catch((err) => {
-      // Non-critical — don't log rate limit errors
       const code = (err as { code?: number })?.code;
       if (code !== 99991400 && code !== 99991403) {
         console.warn('[feishu-adapter] Typing indicator failed:', err instanceof Error ? err.message : err);
@@ -232,20 +290,337 @@ export class FeishuAdapter extends BaseChannelAdapter {
   }
 
   /**
-   * Remove the "Typing" emoji reaction from the user's message.
+   * Remove the "Typing" emoji reaction and clean up card state.
    * Called by bridge-manager via onMessageEnd().
    */
   onMessageEnd(chatId: string): void {
+    // Clean up any orphaned card state (normally cleaned by finalizeCard)
+    this.cleanupCard(chatId);
+
+    // Remove typing reaction (same as before)
     const reactionId = this.typingReactions.get(chatId);
     const messageId = this.lastIncomingMessageId.get(chatId);
     if (!reactionId || !messageId || !this.restClient) return;
-
     this.typingReactions.delete(chatId);
-
-    // Fire-and-forget — failure is fine (reaction may already be gone)
     this.restClient.im.messageReaction.delete({
       path: { message_id: messageId, reaction_id: reactionId },
     }).catch(() => { /* ignore */ });
+  }
+
+  // ── Card Action Handler ─────────────────────────────────────
+
+  /**
+   * Handle card.action.trigger events (button clicks on permission cards).
+   * Converts button clicks to synthetic InboundMessage with callbackData.
+   * Must return within 3 seconds (Feishu timeout), so uses a 2.5s race.
+   */
+  private async handleCardAction(data: unknown): Promise<unknown> {
+    const FALLBACK_TOAST = { toast: { type: 'info' as const, content: '已收到' } };
+
+    try {
+      const event = data as any;
+      const value = event?.action?.value ?? {};
+      const callbackData = value.callback_data;
+      if (!callbackData) return FALLBACK_TOAST;
+
+      // Extract chat/user context
+      const chatId = event?.context?.open_chat_id || value.chatId || '';
+      const messageId = event?.context?.open_message_id || event?.open_message_id || '';
+      const userId = event?.operator?.open_id || event?.open_id || '';
+
+      if (!chatId) return FALLBACK_TOAST;
+
+      const callbackMsg: import('../types.js').InboundMessage = {
+        messageId: messageId || `card_action_${Date.now()}`,
+        address: {
+          channelType: 'feishu',
+          chatId,
+          userId,
+        },
+        text: '',
+        timestamp: Date.now(),
+        callbackData,
+        callbackMessageId: messageId,
+      };
+      this.enqueue(callbackMsg);
+
+      return { toast: { type: 'info' as const, content: '已收到，正在处理...' } };
+    } catch (err) {
+      console.error('[feishu-adapter] Card action handler error:', err instanceof Error ? err.message : err);
+      return FALLBACK_TOAST;
+    }
+  }
+
+  // ── Streaming Card (CardKit v2) ────────────────────────────────
+
+  /**
+   * Create a new streaming card and send it as a message.
+   * Returns true if card was created successfully.
+   */
+  private createStreamingCard(chatId: string, replyToMessageId?: string): Promise<boolean> {
+    if (!this.restClient || this.activeCards.has(chatId)) return Promise.resolve(false);
+
+    // In-flight guard: if creation is already in progress, return the existing promise
+    const existing = this.cardCreatePromises.get(chatId);
+    if (existing) return existing;
+
+    const promise = this._doCreateStreamingCard(chatId, replyToMessageId);
+    this.cardCreatePromises.set(chatId, promise);
+    promise.finally(() => this.cardCreatePromises.delete(chatId));
+    return promise;
+  }
+
+  private async _doCreateStreamingCard(chatId: string, replyToMessageId?: string): Promise<boolean> {
+    if (!this.restClient) return false;
+
+    try {
+      // Step 1: Create card via CardKit v2
+      const cardBody = {
+        schema: '2.0',
+        config: {
+          streaming_mode: true,
+          wide_screen_mode: true,
+          summary: { content: '思考中...' },
+        },
+        body: {
+          elements: [{
+            tag: 'markdown',
+            content: '💭 Thinking...',
+            text_align: 'left',
+            text_size: 'normal',
+            element_id: 'streaming_content',
+          }],
+        },
+      };
+
+      const createResp = await (this.restClient as any).cardkit.v2.card.create({
+        data: { type: 'card_json', data: JSON.stringify(cardBody) },
+      });
+      const cardId = createResp?.data?.card_id;
+      if (!cardId) {
+        console.warn('[feishu-adapter] Card create returned no card_id');
+        return false;
+      }
+
+      // Step 2: Send card as IM message
+      const cardContent = JSON.stringify({ type: 'card', data: { card_id: cardId } });
+      let msgResp;
+      if (replyToMessageId) {
+        msgResp = await this.restClient.im.message.reply({
+          path: { message_id: replyToMessageId },
+          data: { content: cardContent, msg_type: 'interactive' },
+        });
+      } else {
+        msgResp = await this.restClient.im.message.create({
+          params: { receive_id_type: 'chat_id' },
+          data: {
+            receive_id: chatId,
+            msg_type: 'interactive',
+            content: cardContent,
+          },
+        });
+      }
+
+      const messageId = msgResp?.data?.message_id;
+      if (!messageId) {
+        console.warn('[feishu-adapter] Card message send returned no message_id');
+        return false;
+      }
+
+      // Store card state
+      this.activeCards.set(chatId, {
+        cardId,
+        messageId,
+        sequence: 0,
+        startTime: Date.now(),
+        toolCalls: [],
+        thinking: true,
+        pendingText: null,
+        lastUpdateAt: 0,
+        throttleTimer: null,
+      });
+
+      console.log(`[feishu-adapter] Streaming card created: cardId=${cardId}, msgId=${messageId}`);
+      return true;
+    } catch (err) {
+      console.warn('[feishu-adapter] Failed to create streaming card:', err instanceof Error ? err.message : err);
+      return false;
+    }
+  }
+
+  /**
+   * Update streaming card content with throttling.
+   */
+  private updateCardContent(chatId: string, text: string): void {
+    const state = this.activeCards.get(chatId);
+    if (!state || !this.restClient) return;
+
+    // Clear thinking state once text arrives
+    if (state.thinking && text.trim()) {
+      state.thinking = false;
+    }
+    state.pendingText = text;
+
+    const elapsed = Date.now() - state.lastUpdateAt;
+    if (elapsed < CARD_THROTTLE_MS && state.lastUpdateAt > 0) {
+      // Schedule trailing-edge flush
+      if (!state.throttleTimer) {
+        state.throttleTimer = setTimeout(() => {
+          state.throttleTimer = null;
+          this.flushCardUpdate(chatId);
+        }, CARD_THROTTLE_MS - elapsed);
+      }
+      return;
+    }
+
+    // Clear pending timer and flush immediately
+    if (state.throttleTimer) {
+      clearTimeout(state.throttleTimer);
+      state.throttleTimer = null;
+    }
+    this.flushCardUpdate(chatId);
+  }
+
+  /**
+   * Flush pending card update to Feishu API.
+   */
+  private flushCardUpdate(chatId: string): void {
+    const state = this.activeCards.get(chatId);
+    if (!state || !this.restClient) return;
+
+    const content = buildStreamingContent(state.pendingText || '', state.toolCalls);
+
+    state.sequence++;
+    const seq = state.sequence;
+    const cardId = state.cardId;
+
+    // Fire-and-forget — streaming updates are non-critical
+    (this.restClient as any).cardkit.v2.card.streamContent({
+      path: { card_id: cardId },
+      data: { content, sequence: seq },
+    }).then(() => {
+      state.lastUpdateAt = Date.now();
+    }).catch((err: unknown) => {
+      console.warn('[feishu-adapter] streamContent failed:', err instanceof Error ? err.message : err);
+    });
+  }
+
+  /**
+   * Update tool progress in the streaming card.
+   */
+  private updateToolProgress(chatId: string, tools: ToolCallInfo[]): void {
+    const state = this.activeCards.get(chatId);
+    if (!state) return;
+    state.toolCalls = tools;
+    // Trigger a content flush with current text + updated tools
+    this.updateCardContent(chatId, state.pendingText || '');
+  }
+
+  /**
+   * Finalize the streaming card: close streaming mode, update with final content + footer.
+   */
+  private async finalizeCard(
+    chatId: string,
+    status: 'completed' | 'interrupted' | 'error',
+    responseText: string,
+  ): Promise<boolean> {
+    // Wait for in-flight card creation to complete before finalizing
+    const pending = this.cardCreatePromises.get(chatId);
+    if (pending) {
+      try { await pending; } catch { /* creation failed — no card to finalize */ }
+    }
+
+    const state = this.activeCards.get(chatId);
+    if (!state || !this.restClient) return false;
+
+    // Clear any pending throttle timer
+    if (state.throttleTimer) {
+      clearTimeout(state.throttleTimer);
+      state.throttleTimer = null;
+    }
+
+    try {
+      // Step 1: Close streaming mode
+      state.sequence++;
+      await (this.restClient as any).cardkit.v2.card.settings.streamingMode.set({
+        path: { card_id: state.cardId },
+        data: { streaming_mode: false, sequence: state.sequence },
+      });
+
+      // Step 2: Build and apply final card
+      const statusLabels: Record<string, string> = {
+        completed: '✅ Completed',
+        interrupted: '⚠️ Interrupted',
+        error: '❌ Error',
+      };
+      const elapsedMs = Date.now() - state.startTime;
+      const footer = {
+        status: statusLabels[status] || status,
+        elapsed: formatElapsed(elapsedMs),
+      };
+
+      const finalCardJson = buildFinalCardJson(responseText, state.toolCalls, footer);
+
+      state.sequence++;
+      await (this.restClient as any).cardkit.v2.card.update({
+        path: { card_id: state.cardId },
+        data: { type: 'card_json', data: finalCardJson, sequence: state.sequence },
+      });
+
+      console.log(`[feishu-adapter] Card finalized: cardId=${state.cardId}, status=${status}, elapsed=${formatElapsed(elapsedMs)}`);
+      return true;
+    } catch (err) {
+      console.warn('[feishu-adapter] Card finalize failed:', err instanceof Error ? err.message : err);
+      return false;
+    } finally {
+      this.activeCards.delete(chatId);
+    }
+  }
+
+  /**
+   * Clean up card state without finalizing (e.g. on unexpected errors).
+   */
+  private cleanupCard(chatId: string): void {
+    this.cardCreatePromises.delete(chatId);
+    const state = this.activeCards.get(chatId);
+    if (!state) return;
+    if (state.throttleTimer) {
+      clearTimeout(state.throttleTimer);
+    }
+    this.activeCards.delete(chatId);
+  }
+
+  /**
+   * Check if there is an active streaming card for a given chat.
+   */
+  hasActiveCard(chatId: string): boolean {
+    return this.activeCards.has(chatId);
+  }
+
+  // ── Streaming adapter interface ────────────────────────────────
+
+  /**
+   * Called by bridge-manager on each text SSE event.
+   * Creates streaming card on first call, then updates content.
+   */
+  onStreamText(chatId: string, fullText: string): void {
+    if (!this.activeCards.has(chatId)) {
+      // Card should have been created by onMessageStart, but create lazily if not
+      const messageId = this.lastIncomingMessageId.get(chatId);
+      this.createStreamingCard(chatId, messageId).then((ok) => {
+        if (ok) this.updateCardContent(chatId, fullText);
+      }).catch(() => {});
+      return;
+    }
+    this.updateCardContent(chatId, fullText);
+  }
+
+  onToolEvent(chatId: string, tools: ToolCallInfo[]): void {
+    this.updateToolProgress(chatId, tools);
+  }
+
+  async onStreamEnd(chatId: string, status: 'completed' | 'interrupted' | 'error', responseText: string): Promise<boolean> {
+    return this.finalizeCard(chatId, status, responseText);
   }
 
   // ── Send ────────────────────────────────────────────────────
@@ -358,11 +733,8 @@ export class FeishuAdapter extends BaseChannelAdapter {
 
   /**
    * Send a permission card with real Feishu card action buttons.
-   * Button clicks trigger card.action.trigger events handled by handleCardActionEvent().
-   * Feishu card action callbacks require HTTP webhook (not supported via WSClient).
-   * CodePilot is a desktop app without a public endpoint, so we send a
-   * well-formatted card with /perm text commands instead of clickable buttons.
-   * The user replies with the /perm command to approve/deny.
+   * Button clicks trigger card.action.trigger events handled by handleCardAction().
+   * Falls back to text-based /perm commands if button card fails.
    */
   private async sendPermissionCard(
     chatId: string,
@@ -373,20 +745,60 @@ export class FeishuAdapter extends BaseChannelAdapter {
       return { ok: false, error: 'Feishu client not initialized' };
     }
 
-    // Build /perm command lines from inline buttons
+    // Convert HTML text from permission-broker to Feishu markdown.
+    // permission-broker sends HTML (<b>, <code>, <pre>, &amp; entities)
+    // but Feishu card markdown elements don't understand HTML.
+    const mdText = text
+      .replace(/<b>(.*?)<\/b>/gi, '**$1**')
+      .replace(/<code>(.*?)<\/code>/gi, '`$1`')
+      .replace(/<pre>([\s\S]*?)<\/pre>/gi, '```\n$1\n```')
+      .replace(/<[^>]+>/g, '')
+      .replace(/&lt;/g, '<')
+      .replace(/&gt;/g, '>')
+      .replace(/&amp;/g, '&')
+      .replace(/&quot;/g, '"');
+
+    // Extract permissionRequestId from the first button's callback data
+    const firstBtn = inlineButtons.flat()[0];
+    const permId = firstBtn?.callbackData?.startsWith('perm:')
+      ? firstBtn.callbackData.split(':').slice(2).join(':')
+      : '';
+
+    if (permId) {
+      // Use real card action buttons
+      const cardJson = buildPermissionButtonCard(mdText, permId, chatId);
+
+      try {
+        const res = await this.restClient.im.message.create({
+          params: { receive_id_type: 'chat_id' },
+          data: {
+            receive_id: chatId,
+            msg_type: 'interactive',
+            content: cardJson,
+          },
+        });
+        if (res?.data?.message_id) {
+          return { ok: true, messageId: res.data.message_id };
+        }
+        console.warn('[feishu-adapter] Permission button card send failed:', JSON.stringify({ code: (res as any)?.code, msg: res?.msg }));
+      } catch (err) {
+        console.warn('[feishu-adapter] Permission button card error, falling back to text:', err instanceof Error ? err.message : err);
+      }
+    }
+
+    // Fallback: text-based permission commands (same as before, for backward compat)
     const permCommands = inlineButtons.flat().map((btn) => {
       if (btn.callbackData.startsWith('perm:')) {
         const parts = btn.callbackData.split(':');
         const action = parts[1];
-        const permId = parts.slice(2).join(':');
-        return `\`/perm ${action} ${permId}\``;
+        const id = parts.slice(2).join(':');
+        return `\`/perm ${action} ${id}\``;
       }
       return btn.text;
     });
 
-    // Schema 2.0 card with markdown — permission info + shortcut/command options
     const cardContent = [
-      text,
+      mdText,
       '',
       '---',
       '**Reply:**',
@@ -424,20 +836,20 @@ export class FeishuAdapter extends BaseChannelAdapter {
       if (res?.data?.message_id) {
         return { ok: true, messageId: res.data.message_id };
       }
-      console.warn('[feishu-adapter] Permission card send failed:', res?.msg);
+      console.warn('[feishu-adapter] Fallback card also failed:', res?.msg);
     } catch (err) {
-      console.warn('[feishu-adapter] Permission card error:', err instanceof Error ? err.message : err);
+      console.warn('[feishu-adapter] Fallback card error, sending plain text:', err instanceof Error ? err.message : err);
     }
 
-    // Fallback: plain text
-    const plainCommands = inlineButtons.flat().map((btn) => {
-      if (btn.callbackData.startsWith('perm:')) {
-        const parts = btn.callbackData.split(':');
-        return `/perm ${parts[1]} ${parts.slice(2).join(':')}`;
-      }
-      return btn.text;
-    });
-    const fallbackText = text + '\n\nReply:\n1 - Allow once\n2 - Allow session\n3 - Deny\n\nOr use full command:\n' + plainCommands.join('\n');
+    // Last resort: plain text message (works even without card permissions)
+    const plainText = [
+      mdText,
+      '',
+      '---',
+      'Reply: 1 = Allow once | 2 = Allow session | 3 = Deny',
+      '',
+      ...permCommands,
+    ].join('\n');
 
     try {
       const res = await this.restClient.im.message.create({
@@ -445,7 +857,7 @@ export class FeishuAdapter extends BaseChannelAdapter {
         data: {
           receive_id: chatId,
           msg_type: 'text',
-          content: JSON.stringify({ text: fallbackText }),
+          content: JSON.stringify({ text: plainText }),
         },
       });
       if (res?.data?.message_id) {

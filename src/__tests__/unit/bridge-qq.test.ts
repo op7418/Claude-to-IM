@@ -546,6 +546,59 @@ describe('bridge-manager - image download failure reply', () => {
     assert.equal(sentMessages[0].replyToMessageId, 'img-msg-1');
   });
 
+  it('replies to user when non-image attachments fail download', async () => {
+    const { _testOnly } = await import('../../lib/bridge/bridge-manager');
+
+    const sentMessages: OutboundMessage[] = [];
+    const adapter = createMockQQAdapter({
+      sendFn: async (msg) => {
+        sentMessages.push(msg);
+        return { ok: true, messageId: 'reply-2' };
+      },
+    });
+
+    await _testOnly.handleMessage(adapter, {
+      messageId: 'att-msg-1',
+      address: { channelType: 'weixin' as const, chatId: 'user-1', userId: 'user-1' },
+      text: '',
+      timestamp: Date.now(),
+      raw: { attachmentDownloadFailed: true, failedCount: 1, failedLabel: 'attachment(s)' },
+    });
+
+    assert.equal(sentMessages.length, 1);
+    assert.ok(sentMessages[0].text.includes('Failed to download 1 attachment(s)'));
+    assert.equal(sentMessages[0].replyToMessageId, 'att-msg-1');
+  });
+
+  it('replies to user when adapter provides a custom visible error', async () => {
+    const { _testOnly } = await import('../../lib/bridge/bridge-manager');
+
+    const sentMessages: OutboundMessage[] = [];
+    const adapter = createMockQQAdapter({
+      sendFn: async (msg) => {
+        sentMessages.push(msg);
+        return { ok: true, messageId: 'reply-voice-1' };
+      },
+    });
+
+    await _testOnly.handleMessage(adapter, {
+      messageId: 'voice-msg-1',
+      address: { channelType: 'weixin' as const, chatId: 'user-1', userId: 'user-1' },
+      text: '',
+      timestamp: Date.now(),
+      raw: {
+        userVisibleError: 'WeChat did not provide speech-to-text for this voice message. Please enable WeChat voice transcription and send it again.',
+      },
+    });
+
+    assert.equal(sentMessages.length, 1);
+    assert.equal(
+      sentMessages[0].text,
+      'WeChat did not provide speech-to-text for this voice message. Please enable WeChat voice transcription and send it again.',
+    );
+    assert.equal(sentMessages[0].replyToMessageId, 'voice-msg-1');
+  });
+
   it('silently drops empty message without imageDownloadFailed flag', async () => {
     const { _testOnly } = await import('../../lib/bridge/bridge-manager');
 
