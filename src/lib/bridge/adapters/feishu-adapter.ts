@@ -146,6 +146,79 @@ export class FeishuAdapter extends BaseChannelAdapter {
       domain,
     });
 
+    // ── CardKit v1 API monkey-patch ───────────────────────────────────────────
+    // The SDK's built-in CardKit v2 methods use incorrect API paths and a broken
+    // token-fetch implementation. We replace them with direct fetch calls to the
+    // correct CardKit v1 endpoints using a custom getToken.
+    //
+    // Fixes: Card create returns no card_id, streamContent 404, streaming mode
+    // not properly disabled, final content update fails.
+    let _tenantAccessToken = '';
+    const _apiDomain = (this.restClient as any).domain || 'https://open.feishu.cn';
+    const getToken = async (): Promise<string> => {
+      if (_tenantAccessToken) return _tenantAccessToken;
+      try {
+        const res = await fetch(`${_apiDomain}/open-apis/auth/v3/tenant_access_token/internal`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ app_id: appId, app_secret: appSecret }),
+        });
+        const json = await res.json();
+        _tenantAccessToken = json?.tenant_access_token || '';
+      } catch (err) {
+        console.warn('[feishu-adapter] getToken failed:', err instanceof Error ? err.message : err);
+      }
+      return _tenantAccessToken;
+    };
+    (this.restClient as any).cardkit = (this.restClient as any).cardkit || {};
+    (this.restClient as any).cardkit.v2 = {
+      card: {
+        // POST /open-apis/cardkit/v1/cards — flat body {type, data}
+        create: async ({ data }: { data: any }) => {
+          const token = await getToken();
+          const res = await fetch(`${_apiDomain}/open-apis/cardkit/v1/cards`, {
+            method: 'POST',
+            headers: { 'Authorization': `Bearer ${token}`, 'Content-Type': 'application/json' },
+            body: JSON.stringify(data),  // flat {type, data}
+          });
+          return res.json();
+        },
+        // PUT /open-apis/cardkit/v1/cards/{id}/elements/{element_id}/content — flat body
+        streamContent: async ({ path, data }: { path: { card_id: string }; data: any }) => {
+          const token = await getToken();
+          return fetch(`${_apiDomain}/open-apis/cardkit/v1/cards/${path.card_id}/elements/streaming_content/content`, {
+            method: 'PUT',
+            headers: { 'Authorization': `Bearer ${token}`, 'Content-Type': 'application/json' },
+            body: JSON.stringify({ content: data.content, sequence: data.sequence }),
+          });
+        },
+        settings: {
+          streamingMode: {
+            // PATCH /open-apis/cardkit/v1/cards/{id}/settings — flat body
+            set: async ({ path, data }: { path: { card_id: string }; data: any }) => {
+              const token = await getToken();
+              return fetch(`${_apiDomain}/open-apis/cardkit/v1/cards/${path.card_id}/settings`, {
+                method: 'PATCH',
+                headers: { 'Authorization': `Bearer ${token}`, 'Content-Type': 'application/json' },
+                body: JSON.stringify({ settings: JSON.stringify({ streaming_mode: data.streaming_mode }), sequence: data.sequence }),
+              });
+            },
+          },
+        },
+        // PUT /open-apis/cardkit/v1/cards/{id} — flat body
+        update: async ({ path, data }: { path: { card_id: string }; data: any }) => {
+          const token = await getToken();
+          const res = await fetch(`${_apiDomain}/open-apis/cardkit/v1/cards/${path.card_id}`, {
+            method: 'PUT',
+            headers: { 'Authorization': `Bearer ${token}`, 'Content-Type': 'application/json' },
+            body: JSON.stringify({ card: { type: data.type, data: data.data }, sequence: data.sequence }),
+          });
+          return res.json();
+        },
+      },
+    };
+    // ── End CardKit patch ─────────────────────────────────────────────────────
+
     // Resolve bot identity for @mention detection
     await this.resolveBotIdentity(appId, appSecret, domain);
 
