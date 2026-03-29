@@ -43,7 +43,7 @@ export class QQAdapter extends BaseChannelAdapter {
   private heartbeatTimer: ReturnType<typeof setInterval> | null = null;
   private lastSequence: number | null = null;
   private sessionId: string | null = null;
-  private seenMessageIds = new Map<string, boolean>();
+  // Inbound dedup now uses persistent store (survives process restarts)
   private reconnectAttempts = 0;
   private maxReconnectAttempts = 10;
   private shouldReconnect = false;
@@ -97,7 +97,6 @@ export class QQAdapter extends BaseChannelAdapter {
     }
     this.waiters = [];
     this.queue = [];
-    this.seenMessageIds.clear();
 
     console.log('[qq-adapter] Stopped');
   }
@@ -294,20 +293,10 @@ export class QQAdapter extends BaseChannelAdapter {
   private handleC2CMessage(data: QQC2CMessageData): void {
     if (!data?.id || !data?.author?.user_openid) return;
 
-    // Dedup
-    if (this.seenMessageIds.has(data.id)) return;
-    this.seenMessageIds.set(data.id, true);
-
-    // Evict oldest when exceeding limit
-    if (this.seenMessageIds.size > 1000) {
-      const excess = this.seenMessageIds.size - 1000;
-      let removed = 0;
-      for (const key of this.seenMessageIds.keys()) {
-        if (removed >= excess) break;
-        this.seenMessageIds.delete(key);
-        removed++;
-      }
-    }
+    // Dedup — persistent via store (survives process restarts)
+    const store = getBridgeContext().store;
+    if (store.checkDedup(data.id)) return;
+    store.insertDedup(data.id);
 
     const userId = data.author.user_openid;
 

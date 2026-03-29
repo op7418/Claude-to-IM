@@ -39,8 +39,7 @@ import {
   formatElapsed,
 } from '../markdown/feishu.js';
 
-/** Max number of message_ids to keep for dedup. */
-const DEDUP_MAX = 1000;
+
 
 /** Max file download size (20 MB). */
 const MAX_FILE_SIZE = 20 * 1024 * 1024;
@@ -108,7 +107,7 @@ export class FeishuAdapter extends BaseChannelAdapter {
   private waiters: Array<(msg: InboundMessage | null) => void> = [];
   private wsClient: lark.WSClient | null = null;
   private restClient: lark.Client | null = null;
-  private seenMessageIds = new Map<string, boolean>();
+  // Inbound dedup now uses persistent store (survives process restarts)
   private botOpenId: string | null = null;
   /** All known bot IDs (open_id, user_id, union_id) for mention matching. */
   private botIds = new Set<string>();
@@ -224,7 +223,6 @@ export class FeishuAdapter extends BaseChannelAdapter {
     this.cardCreatePromises.clear();
 
     // Clear state
-    this.seenMessageIds.clear();
     this.lastIncomingMessageId.clear();
     this.typingReactions.clear();
 
@@ -921,9 +919,10 @@ export class FeishuAdapter extends BaseChannelAdapter {
     // [P1] Filter out bot messages to prevent self-triggering loops
     if (sender.sender_type === 'bot') return;
 
-    // Dedup by message_id
-    if (this.seenMessageIds.has(msg.message_id)) return;
-    this.addToDedup(msg.message_id);
+    // Dedup by message_id — persistent via store (survives process restarts)
+    const store = getBridgeContext().store;
+    if (store.checkDedup(msg.message_id)) return;
+    store.insertDedup(msg.message_id);
 
     const chatId = msg.chat_id;
     // [P2] Complete sender ID fallback chain: open_id > user_id > union_id
@@ -1347,20 +1346,7 @@ export class FeishuAdapter extends BaseChannelAdapter {
 
   // ── Utilities ───────────────────────────────────────────────
 
-  private addToDedup(messageId: string): void {
-    this.seenMessageIds.set(messageId, true);
-
-    // LRU eviction: remove oldest entries when exceeding limit
-    if (this.seenMessageIds.size > DEDUP_MAX) {
-      const excess = this.seenMessageIds.size - DEDUP_MAX;
-      let removed = 0;
-      for (const key of this.seenMessageIds.keys()) {
-        if (removed >= excess) break;
-        this.seenMessageIds.delete(key);
-        removed++;
-      }
-    }
-  }
+  // addToDedup removed — now using persistent store.insertDedup()
 }
 
 // Self-register so bridge-manager can create FeishuAdapter via the registry.
