@@ -100,7 +100,7 @@ export interface ChannelBinding {
   /** Model override for this binding */
   model: string;
   /** Chat mode */
-  mode: 'code' | 'plan' | 'ask';
+  mode: 'code' | 'plan' | 'ask' | 'bypass';
   /** Whether this binding is currently active */
   active: boolean;
   createdAt: string;

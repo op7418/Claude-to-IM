@@ -821,7 +821,7 @@ async function handleCommand(
         '/new [path] - Start new session',
         '/bind &lt;session_id&gt; - Bind to existing session',
         '/cwd /path - Change working directory',
-        '/mode plan|code|ask - Change mode',
+        '/mode plan|code|ask|bypass - Change mode',
         '/status - Show current status',
         '/sessions - List recent sessions',
         '/stop - Stop current session',
@@ -890,7 +890,7 @@ async function handleCommand(
 
     case '/mode': {
       if (!validateMode(args)) {
-        response = 'Usage: /mode plan|code|ask';
+        response = 'Usage: /mode plan|code|ask|bypass';
         break;
       }
       const binding = router.resolve(msg.address);
@@ -968,7 +968,7 @@ async function handleCommand(
         '/new [path] - Start new session',
         '/bind &lt;session_id&gt; - Bind to existing session',
         '/cwd /path - Change working directory',
-        '/mode plan|code|ask - Change mode',
+        '/mode plan|code|ask|bypass - Change mode',
         '/status - Show current status',
         '/sessions - List recent sessions',
         '/stop - Stop current session',
