@@ -999,20 +999,26 @@ async function handleCommand(
  * Returns the new value to write, or null if no update is needed.
  *
  * Rules:
- * - If result has sdkSessionId AND no error → save the new ID
- * - If result has error (regardless of sdkSessionId) → clear to empty string
- * - Otherwise → no update needed
+ * - If result has sdkSessionId (regardless of error) → save/keep the ID
+ *   so the next message can resume the same conversation context.
+ * - If no sdkSessionId was captured → no update (preserve existing).
+ *
+ * Rationale: Clearing the sdkSessionId on transient errors (timeouts,
+ * rate limits, tool crashes) causes the next message to start a fresh
+ * session, losing all prior conversation context. Since the SDK session
+ * itself is still valid on the server side, preserving the ID allows
+ * seamless resume and avoids the "amnesia" problem.
  */
 export function computeSdkSessionUpdate(
   sdkSessionId: string | null | undefined,
   hasError: boolean,
 ): string | null {
-  if (sdkSessionId && !hasError) {
+  // Always persist a captured session ID — even after errors the session
+  // is still resumable on the server side.
+  if (sdkSessionId) {
     return sdkSessionId;
   }
-  if (hasError) {
-    return '';
-  }
+  // No session ID captured: leave the existing binding value untouched.
   return null;
 }
 
