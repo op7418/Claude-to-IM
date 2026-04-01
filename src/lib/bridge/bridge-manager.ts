@@ -27,6 +27,91 @@ import {
   sanitizeInput,
   validateMode,
 } from './security/validators.js';
+import { readFileSync, existsSync, statSync, openSync, readSync, closeSync, fstatSync } from 'node:fs';
+import { join } from 'node:path';
+import { homedir } from 'node:os';
+
+// ── Session preview helpers ────────────────────────────────────
+
+/**
+ * Clean raw message text for single-line preview display.
+ * Strips markdown formatting, HTML/XML tags, collapses whitespace.
+ */
+function cleanPreviewText(raw: string, maxLen: number): string {
+  let t = raw;
+  // Strip [sender: ...] prefix (claude-to-im injects this)
+  t = t.replace(/^\[sender:\s*[^\]]*\]\s*/, '');
+  // Strip HTML/XML tags
+  t = t.replace(/<[^>]*>/g, '');
+  // Strip markdown: bold, italic, headers, links, images
+  t = t.replace(/\*\*([^*]*)\*\*/g, '$1');
+  t = t.replace(/\*([^*]*)\*/g, '$1');
+  t = t.replace(/`{1,3}[^`]*`{1,3}/g, '');
+  t = t.replace(/^#{1,6}\s+/gm, '');
+  t = t.replace(/\[([^\]]*)\]\([^)]*\)/g, '$1');
+  t = t.replace(/!\[([^\]]*)\]\([^)]*\)/g, '');
+  // Strip list prefixes and table pipes
+  t = t.replace(/^\s*[-*+]\s+/gm, '');
+  t = t.replace(/^\s*\d+\.\s+/gm, '');
+  t = t.replace(/\|/g, ' ');
+  // Collapse to single line
+  t = t.replace(/\n+/g, ' ').replace(/\s+/g, ' ').trim();
+  if (!t) return '';
+  if (t.length > maxLen) t = t.slice(0, maxLen) + '\u2026';
+  return t;
+}
+
+/**
+ * Extract the last meaningful text from JSONL lines (searched in reverse).
+ * Accepts both user and assistant messages.
+ */
+function extractLastText(jsonLines: string[], maxLen: number): string {
+  for (let i = jsonLines.length - 1; i >= 0; i--) {
+    try {
+      const obj = JSON.parse(jsonLines[i]);
+      if ((obj.type === 'user' || obj.type === 'assistant') && obj.message?.role) {
+        const content = obj.message.content;
+        let raw = '';
+        if (typeof content === 'string') raw = content;
+        else if (Array.isArray(content)) {
+          for (const block of content) {
+            if (block?.type === 'text' && block.text) { raw = block.text; break; }
+          }
+        }
+        if (!raw) continue;
+        // Skip system/meta content
+        const firstLine = raw.split('\n')[0].trim();
+        if (/^\/(clear|compact|help|init|sessions|switch)/.test(firstLine)) continue;
+        if (/^\[.*\d{4}-\d{2}-\d{2}/.test(firstLine) || /^\[.*GMT/.test(firstLine)) continue;
+        if (/^Caveat:|^<system-reminder>|^<command-|^<local-command/.test(firstLine)) continue;
+        const cleaned = cleanPreviewText(raw, maxLen);
+        if (cleaned) return cleaned;
+      }
+    } catch { continue; }
+  }
+  return '';
+}
+
+/**
+ * Get a preview of the last message in a Claude Code session.
+ * Reads the tail of the session's JSONL file for performance.
+ */
+function getSessionPreview(sdkSessionId: string, workdir: string, maxLen = 45): string {
+  if (!sdkSessionId) return '';
+  try {
+    const projectDir = (workdir || '~').replace(/[^a-zA-Z0-9.]/g, '-');
+    const jsonlPath = join(homedir(), '.claude', 'projects', projectDir, `${sdkSessionId}.jsonl`);
+    if (!existsSync(jsonlPath)) return '';
+    const fd = openSync(jsonlPath, 'r');
+    const size = fstatSync(fd).size;
+    const tailSize = Math.min(size, 65536);
+    const buf = Buffer.alloc(tailSize);
+    readSync(fd, buf, 0, tailSize, Math.max(0, size - tailSize));
+    closeSync(fd);
+    const lines = buf.toString('utf-8').trimEnd().split('\n');
+    return extractLastText(lines, maxLen);
+  } catch { return ''; }
+}
 
 const GLOBAL_KEY = '__bridge_manager__';
 
@@ -917,10 +1002,23 @@ async function handleCommand(
       if (bindings.length === 0) {
         response = 'No sessions found.';
       } else {
+        const currentBinding = router.resolve(msg.address);
+        // Sort by most recently active first
+        const sorted = bindings.slice().sort((a, b) => {
+          const ta = a.updatedAt || a.createdAt || '';
+          const tb = b.updatedAt || b.createdAt || '';
+          return tb.localeCompare(ta);
+        });
         const lines = ['<b>Sessions:</b>', ''];
-        for (const b of bindings.slice(0, 10)) {
-          const active = b.active ? 'active' : 'inactive';
-          lines.push(`<code>${b.codepilotSessionId.slice(0, 8)}...</code> [${active}] ${escapeHtml(b.workingDirectory || '~')}`);
+        const shown = sorted.slice(0, 15);
+        for (let i = 0; i < shown.length; i++) {
+          const b = shown[i];
+          const isCurrent = currentBinding && b.codepilotSessionId === currentBinding.codepilotSessionId;
+          const marker = isCurrent ? ' \u25C0' : '';
+          const id = (b.sdkSessionId || b.codepilotSessionId).slice(0, 8);
+          const preview = getSessionPreview(b.sdkSessionId, b.workingDirectory);
+          const previewLine = preview ? `\n    \uD83D\uDCAC ${escapeHtml(preview)}` : '';
+          lines.push(`<b>${i + 1}.</b> <code>${id}</code>${marker}${previewLine}`);
         }
         response = lines.join('\n');
       }
