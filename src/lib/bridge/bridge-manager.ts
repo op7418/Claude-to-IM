@@ -27,6 +27,202 @@ import {
   sanitizeInput,
   validateMode,
 } from './security/validators.js';
+import { readFileSync, existsSync, readdirSync, statSync, openSync, readSync, closeSync, fstatSync } from 'node:fs';
+import { join } from 'node:path';
+import { homedir } from 'node:os';
+
+// ── Session preview helpers ────────────────────────────────────
+
+/**
+ * Clean raw message text for single-line preview display.
+ * Strips markdown formatting, HTML/XML tags, collapses whitespace.
+ */
+function cleanPreviewText(raw: string, maxLen: number): string {
+  let t = raw;
+  // Strip [sender: ...] prefix (claude-to-im injects this)
+  t = t.replace(/^\[sender:\s*[^\]]*\]\s*/, '');
+  // Strip HTML/XML tags
+  t = t.replace(/<[^>]*>/g, '');
+  // Strip markdown: bold, italic, headers, links, images
+  t = t.replace(/\*\*([^*]*)\*\*/g, '$1');
+  t = t.replace(/\*([^*]*)\*/g, '$1');
+  t = t.replace(/`{1,3}[^`]*`{1,3}/g, '');
+  t = t.replace(/^#{1,6}\s+/gm, '');
+  t = t.replace(/\[([^\]]*)\]\([^)]*\)/g, '$1');
+  t = t.replace(/!\[([^\]]*)\]\([^)]*\)/g, '');
+  // Strip list prefixes and table pipes
+  t = t.replace(/^\s*[-*+]\s+/gm, '');
+  t = t.replace(/^\s*\d+\.\s+/gm, '');
+  t = t.replace(/\|/g, ' ');
+  // Collapse to single line
+  t = t.replace(/\n+/g, ' ').replace(/\s+/g, ' ').trim();
+  if (!t) return '';
+  if (t.length > maxLen) t = t.slice(0, maxLen) + '\u2026';
+  return t;
+}
+
+/**
+ * Extract the last meaningful text from JSONL lines (searched in reverse).
+ * Accepts both user and assistant messages.
+ */
+function extractLastText(jsonLines: string[], maxLen: number): string {
+  for (let i = jsonLines.length - 1; i >= 0; i--) {
+    try {
+      const obj = JSON.parse(jsonLines[i]);
+      if ((obj.type === 'user' || obj.type === 'assistant') && obj.message?.role) {
+        const content = obj.message.content;
+        let raw = '';
+        if (typeof content === 'string') raw = content;
+        else if (Array.isArray(content)) {
+          for (const block of content) {
+            if (block?.type === 'text' && block.text) { raw = block.text; break; }
+          }
+        }
+        if (!raw) continue;
+        // Skip system/meta content
+        const firstLine = raw.split('\n')[0].trim();
+        if (/^\/(clear|compact|help|init|sessions|switch)/.test(firstLine)) continue;
+        if (/^\[.*\d{4}-\d{2}-\d{2}/.test(firstLine) || /^\[.*GMT/.test(firstLine)) continue;
+        if (/^Caveat:|^<system-reminder>|^<command-|^<local-command/.test(firstLine)) continue;
+        const cleaned = cleanPreviewText(raw, maxLen);
+        if (cleaned) return cleaned;
+      }
+    } catch { continue; }
+  }
+  return '';
+}
+
+/**
+ * Get a preview of the last message in a Claude Code session.
+ * Reads the tail of the session's JSONL file for performance.
+ */
+function getSessionPreview(sdkSessionId: string, workdir: string, maxLen = 45): string {
+  if (!sdkSessionId) return '';
+  try {
+    const projectDir = (workdir || '~').replace(/[^a-zA-Z0-9.]/g, '-');
+    const jsonlPath = join(homedir(), '.claude', 'projects', projectDir, `${sdkSessionId}.jsonl`);
+    if (!existsSync(jsonlPath)) return '';
+    const fd = openSync(jsonlPath, 'r');
+    const size = fstatSync(fd).size;
+    const tailSize = Math.min(size, 65536);
+    const buf = Buffer.alloc(tailSize);
+    readSync(fd, buf, 0, tailSize, Math.max(0, size - tailSize));
+    closeSync(fd);
+    const lines = buf.toString('utf-8').trimEnd().split('\n');
+    return extractLastText(lines, maxLen);
+  } catch { return ''; }
+}
+
+/**
+ * Get the working directory from a session's JSONL file header.
+ */
+function getCwdFromSession(filePath: string): string | null {
+  try {
+    const fd = openSync(filePath, 'r');
+    const buf = Buffer.alloc(4096);
+    const bytesRead = readSync(fd, buf, 0, 4096, 0);
+    closeSync(fd);
+    const head = buf.toString('utf-8', 0, bytesRead);
+    for (const line of head.split('\n').slice(0, 10)) {
+      try {
+        const obj = JSON.parse(line);
+        if (obj.cwd) return obj.cwd;
+      } catch { /* skip */ }
+    }
+  } catch { /* skip */ }
+  return null;
+}
+
+/**
+ * Get a preview from a JSONL file path (for CLI sessions without a binding).
+ */
+function getSessionPreviewFromFile(filePath: string, maxLen = 45): string {
+  try {
+    if (!existsSync(filePath)) return '';
+    const fd = openSync(filePath, 'r');
+    const size = fstatSync(fd).size;
+    const tailSize = Math.min(size, 65536);
+    const buf = Buffer.alloc(tailSize);
+    readSync(fd, buf, 0, tailSize, Math.max(0, size - tailSize));
+    const lines = buf.toString('utf-8').trimEnd().split('\n');
+    let result = extractLastText(lines, maxLen);
+    if (!result && size > tailSize) {
+      const headSize = Math.min(size, 16384);
+      const headBuf = Buffer.alloc(headSize);
+      readSync(fd, headBuf, 0, headSize, 0);
+      const headLines = headBuf.toString('utf-8').trimEnd().split('\n');
+      result = extractLastText(headLines.reverse(), maxLen);
+    }
+    closeSync(fd);
+    return result;
+  } catch { return ''; }
+}
+
+interface SessionEntry {
+  type: 'im' | 'terminal';
+  mtime: number;
+  binding?: import('./types.js').ChannelBinding;
+  sdkSessionId?: string;
+  projectDir?: string;
+  filePath?: string;
+}
+
+/**
+ * Scan all Claude Code sessions from ~/.claude/projects/, excluding already-bound ones.
+ */
+function scanAllSessions(boundSdkIds: Set<string>, limit = 20): Array<{ sdkSessionId: string; projectDir: string; filePath: string; mtime: number }> {
+  const projectsRoot = join(homedir(), '.claude', 'projects');
+  if (!existsSync(projectsRoot)) return [];
+  const results: Array<{ sdkSessionId: string; projectDir: string; filePath: string; mtime: number }> = [];
+  try {
+    const projectDirs = readdirSync(projectsRoot, { withFileTypes: true }).filter(d => d.isDirectory());
+    for (const pd of projectDirs) {
+      const pdPath = join(projectsRoot, pd.name);
+      let entries;
+      try { entries = readdirSync(pdPath, { withFileTypes: true }); } catch { continue; }
+      for (const f of entries) {
+        if (!f.isFile() || !f.name.endsWith('.jsonl')) continue;
+        const sessionId = f.name.replace('.jsonl', '');
+        if (boundSdkIds.has(sessionId)) continue;
+        const fullPath = join(pdPath, f.name);
+        try {
+          const st = statSync(fullPath);
+          results.push({ sdkSessionId: sessionId, projectDir: pd.name, filePath: fullPath, mtime: st.mtimeMs });
+        } catch { continue; }
+      }
+    }
+  } catch { /* skip */ }
+  results.sort((a, b) => b.mtime - a.mtime);
+  return results.slice(0, limit);
+}
+
+/**
+ * Build a unified list of all sessions (IM-bound + terminal CLI), sorted by last activity.
+ */
+function buildAllEntries(bindings: import('./types.js').ChannelBinding[]): SessionEntry[] {
+  const boundSdkIds = new Set<string>();
+  const allEntries: SessionEntry[] = [];
+  for (const b of bindings) {
+    if (b.sdkSessionId) boundSdkIds.add(b.sdkSessionId);
+    let mtime = 0;
+    if (b.sdkSessionId) {
+      try {
+        const pDir = (b.workingDirectory || '~').replace(/[^a-zA-Z0-9.]/g, '-');
+        const jp = join(homedir(), '.claude', 'projects', pDir, `${b.sdkSessionId}.jsonl`);
+        mtime = statSync(jp).mtimeMs;
+      } catch { /* skip */ }
+    }
+    if (!mtime && b.updatedAt) mtime = new Date(b.updatedAt).getTime();
+    if (!mtime && b.createdAt) mtime = new Date(b.createdAt).getTime();
+    allEntries.push({ type: 'im', binding: b, mtime });
+  }
+  const termSessions = scanAllSessions(boundSdkIds, 20);
+  for (const ts of termSessions) {
+    allEntries.push({ type: 'terminal', sdkSessionId: ts.sdkSessionId, projectDir: ts.projectDir, filePath: ts.filePath, mtime: ts.mtime });
+  }
+  allEntries.sort((a, b) => b.mtime - a.mtime);
+  return allEntries.slice(0, 15);
+}
 
 const GLOBAL_KEY = '__bridge_manager__';
 
@@ -824,6 +1020,7 @@ async function handleCommand(
         '/mode plan|code|ask - Change mode',
         '/status - Show current status',
         '/sessions - List recent sessions',
+        '/switch &lt;n&gt; - Switch to session by number',
         '/stop - Stop current session',
         '/perm allow|allow_session|deny &lt;id&gt; - Respond to permission',
         '/help - Show this help',
@@ -914,14 +1111,33 @@ async function handleCommand(
 
     case '/sessions': {
       const bindings = router.listBindings(adapter.channelType);
-      if (bindings.length === 0) {
+      const currentBinding = router.resolve(msg.address);
+      const allEntries = buildAllEntries(bindings);
+
+      if (allEntries.length === 0) {
         response = 'No sessions found.';
       } else {
         const lines = ['<b>Sessions:</b>', ''];
-        for (const b of bindings.slice(0, 10)) {
-          const active = b.active ? 'active' : 'inactive';
-          lines.push(`<code>${b.codepilotSessionId.slice(0, 8)}...</code> [${active}] ${escapeHtml(b.workingDirectory || '~')}`);
+        for (let i = 0; i < allEntries.length; i++) {
+          const e = allEntries[i];
+          if (e.type === 'im') {
+            const b = e.binding!;
+            const isCurrent = currentBinding && b.codepilotSessionId === currentBinding.codepilotSessionId;
+            const marker = isCurrent ? ' \u25C0' : '';
+            const id = (b.sdkSessionId || b.codepilotSessionId).slice(0, 8);
+            const preview = getSessionPreview(b.sdkSessionId, b.workingDirectory);
+            const previewLine = preview ? `\n    \uD83D\uDCAC ${escapeHtml(preview)}` : '';
+            lines.push(`<b>${i + 1}.</b> <code>${id}</code> [IM]${marker}${previewLine}`);
+          } else {
+            const id = e.sdkSessionId!.slice(0, 8);
+            const label = getCwdFromSession(e.filePath!) || e.projectDir!;
+            const preview = getSessionPreviewFromFile(e.filePath!);
+            const previewLine = preview ? `\n    \uD83D\uDCAC ${escapeHtml(preview)}` : '';
+            lines.push(`<b>${i + 1}.</b> <code>${id}</code> [CLI] ${escapeHtml(label)}${previewLine}`);
+          }
         }
+        lines.push('');
+        lines.push('/switch &lt;n&gt; to switch session');
         response = lines.join('\n');
       }
       break;
@@ -971,12 +1187,53 @@ async function handleCommand(
         '/mode plan|code|ask - Change mode',
         '/status - Show current status',
         '/sessions - List recent sessions',
+        '/switch &lt;n&gt; - Switch to session by number',
         '/stop - Stop current session',
         '/perm allow|allow_session|deny &lt;id&gt; - Respond to permission request',
         '1/2/3 - Quick permission reply (Feishu/QQ/WeChat, single pending)',
         '/help - Show this help',
       ].join('\n');
       break;
+
+    case '/switch': {
+      const n = parseInt(args, 10);
+      if (!n || n < 1) {
+        response = 'Usage: /switch &lt;n&gt; (use /sessions to see the list)';
+        break;
+      }
+      const swBindings = router.listBindings(adapter.channelType);
+      const swEntries = buildAllEntries(swBindings);
+      if (n > swEntries.length) {
+        response = `Session #${n} not found. Only ${swEntries.length} session(s) available.`;
+        break;
+      }
+      const target = swEntries[n - 1];
+      // Abort running task on old session
+      const oldBinding = router.resolve(msg.address);
+      const st = getState();
+      const oldTask = st.activeTasks.get(oldBinding.codepilotSessionId);
+      if (oldTask) {
+        oldTask.abort();
+        st.activeTasks.delete(oldBinding.codepilotSessionId);
+      }
+      if (target.type === 'im') {
+        const result = router.bindToSession(msg.address, target.binding!.codepilotSessionId);
+        if (result) {
+          const id = (target.binding!.sdkSessionId || target.binding!.codepilotSessionId).slice(0, 8);
+          response = `Switched to session <code>${id}</code> [IM]`;
+        } else {
+          response = 'Failed to switch \u2014 session not found in store.';
+        }
+      } else {
+        // CLI session: create new bridge binding, then set sdkSessionId to resume
+        const cwd = getCwdFromSession(target.filePath!) || undefined;
+        const newBinding = router.createBinding(msg.address, cwd);
+        router.updateBinding(newBinding.id, { sdkSessionId: target.sdkSessionId! });
+        const id = target.sdkSessionId!.slice(0, 8);
+        response = `Switched to session <code>${id}</code> [CLI]\nCWD: <code>${escapeHtml(cwd || '~')}</code>\n\n<i>Next message will resume this CLI session.</i>`;
+      }
+      break;
+    }
 
     default:
       response = `Unknown command: ${escapeHtml(command)}\nType /help for available commands.`;
