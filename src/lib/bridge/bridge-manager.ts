@@ -724,9 +724,10 @@ async function handleMessage(
 
   // ── Streaming preview setup ──────────────────────────────────
   let previewState: StreamingPreviewState | null = null;
-  const caps = incrementalParts
-    ? null
-    : (adapter.getPreviewCapabilities?.(msg.address.chatId) ?? null);
+  const allowPreviewWithIncremental = adapter.channelType === 'telegram';
+  const caps = (!incrementalParts || allowPreviewWithIncremental)
+    ? (adapter.getPreviewCapabilities?.(msg.address.chatId) ?? null)
+    : null;
   if (caps?.supported) {
     previewState = {
       draftId: generateDraftId(),
