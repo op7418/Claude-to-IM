@@ -46,6 +46,19 @@ export abstract class BaseChannelAdapter {
   abstract send(message: OutboundMessage): Promise<SendResult>;
 
   /**
+   * Edit a previously sent outbound message.
+   * Default is unsupported; adapters can override when the platform allows it.
+   */
+  async editMessage?(
+    _chatId: string,
+    _messageId: string,
+    _text: string,
+    _parseMode?: OutboundMessage['parseMode'],
+  ): Promise<SendResult> {
+    return { ok: false, error: 'editMessage not supported' };
+  }
+
+  /**
    * Answer a callback query (e.g. Telegram inline button press).
    * Not all platforms support this — default implementation is a no-op.
    */

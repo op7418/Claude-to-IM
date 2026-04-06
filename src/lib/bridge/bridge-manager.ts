@@ -8,6 +8,7 @@
  */
 
 import type { BridgeStatus, InboundMessage, OutboundMessage, StreamingPreviewState, ToolCallInfo } from './types.js';
+import type { MessageContentBlock } from './host.js';
 import { createAdapter, getRegisteredTypes } from './channel-adapter.js';
 import type { BaseChannelAdapter } from './channel-adapter.js';
 // Side-effect import: triggers self-registration of all adapter factories
@@ -150,6 +151,126 @@ async function deliverResponse(
   return deliver(adapter, {
     address,
     text: responseText,
+    parseMode: 'plain',
+    replyToMessageId,
+  }, { sessionId });
+}
+
+function supportsIncrementalParts(
+  adapter: BaseChannelAdapter,
+  chatId: string,
+  hasStreamingCards: boolean,
+): boolean {
+  if (hasStreamingCards) return false;
+  if (adapter.channelType === 'telegram') return true;
+  const caps = adapter.getPreviewCapabilities?.(chatId) ?? null;
+  if (caps?.supported) return false;
+  return adapter.channelType === 'qq' || adapter.channelType === 'weixin';
+}
+
+function renderContentBlock(block: MessageContentBlock): { text: string; markdown: boolean } | null {
+  if (block.type === 'text') {
+    const text = block.text.trim();
+    return text ? { text, markdown: true } : null;
+  }
+
+  if (block.type === 'tool_use') {
+    return {
+      text: [
+        `[tool_use] ${block.name}`,
+        '',
+        '```json',
+        JSON.stringify(block.input, null, 2),
+        '```',
+      ].join('\n'),
+      markdown: true,
+    };
+  }
+
+  if (block.type === 'tool_result') {
+    const body = typeof block.content === 'string'
+      ? block.content
+      : JSON.stringify(block.content, null, 2);
+    return {
+      text: [
+        `[tool_result${block.is_error ? ':error' : ''}] ${block.tool_use_id}`,
+        '',
+        body || '(empty)',
+      ].join('\n'),
+      markdown: true,
+    };
+  }
+
+  if (block.type === 'code') {
+    return {
+      text: `\`\`\`${block.language}\n${block.code}\n\`\`\``,
+      markdown: true,
+    };
+  }
+
+  return null;
+}
+
+function renderToolStatusMessage(
+  toolName: string,
+  status: 'running' | 'success' | 'error',
+  toolInput?: unknown,
+): { text: string; markdown: boolean } {
+  const statusText = status === 'running'
+    ? '⏳ 运行中'
+    : status === 'success'
+      ? '✅ 成功'
+      : '❌ 失败';
+
+  const details = (() => {
+    if (!toolInput) return null;
+    if (
+      toolName === 'Bash' &&
+      typeof toolInput === 'object' &&
+      toolInput !== null &&
+      'command' in toolInput &&
+      typeof (toolInput as { command?: unknown }).command === 'string'
+    ) {
+      return [
+        '```sh',
+        (toolInput as { command: string }).command,
+        '```',
+      ].join('\n');
+    }
+    return [
+      '```json',
+      JSON.stringify(toolInput, null, 2),
+      '```',
+    ].join('\n');
+  })();
+
+  return {
+    text: [
+      `🛠️ [tool] ${toolName}`,
+      details ? `\n${details}\n` : '',
+      `状态: ${statusText}`,
+    ].filter(Boolean).join('\n'),
+    markdown: true,
+  };
+}
+
+async function deliverContentBlock(
+  adapter: BaseChannelAdapter,
+  address: ChannelAddress,
+  block: MessageContentBlock,
+  sessionId: string,
+  replyToMessageId?: string,
+): Promise<SendResult> {
+  const rendered = renderContentBlock(block);
+  if (!rendered) return { ok: true };
+
+  if (rendered.markdown) {
+    return deliverResponse(adapter, address, rendered.text, sessionId, replyToMessageId);
+  }
+
+  return deliver(adapter, {
+    address,
+    text: rendered.text,
     parseMode: 'plain',
     replyToMessageId,
   }, { sessionId });
@@ -597,9 +718,15 @@ async function handleMessage(
   const state = getState();
   state.activeTasks.set(binding.codepilotSessionId, taskAbort);
 
+  // ── Streaming card / incremental mode detection ──────────────
+  const hasStreamingCards = typeof adapter.onStreamText === 'function';
+  const incrementalParts = supportsIncrementalParts(adapter, msg.address.chatId, hasStreamingCards);
+
   // ── Streaming preview setup ──────────────────────────────────
   let previewState: StreamingPreviewState | null = null;
-  const caps = adapter.getPreviewCapabilities?.(msg.address.chatId) ?? null;
+  const caps = incrementalParts
+    ? null
+    : (adapter.getPreviewCapabilities?.(msg.address.chatId) ?? null);
   if (caps?.supported) {
     previewState = {
       draftId: generateDraftId(),
@@ -663,8 +790,8 @@ async function handleMessage(
   // onStreamText, onToolEvent, and onStreamEnd callbacks.
   // These run in parallel with the existing preview system — Feishu
   // uses cards instead of message edit for streaming.
-  const hasStreamingCards = typeof adapter.onStreamText === 'function';
   const toolCallTracker = new Map<string, ToolCallInfo>();
+  const toolStatusMessages = new Map<string, { messageId: string; name: string; input?: unknown }>();
 
   const onStreamCardText = hasStreamingCards ? (fullText: string) => {
     try { adapter.onStreamText!(msg.address.chatId, fullText); } catch { /* non-critical */ }
@@ -706,7 +833,99 @@ async function handleMessage(
         perm.suggestions,
         msg.messageId,
       );
-    }, taskAbort.signal, hasAttachments ? msg.attachments : undefined, onPartialText, onToolEvent);
+    }, taskAbort.signal, hasAttachments ? msg.attachments : undefined, onPartialText, onToolEvent, async (block) => {
+      if (!incrementalParts) return;
+
+      if (block.type === 'tool_use') {
+        const rendered = renderToolStatusMessage(block.name, 'running', block.input);
+        const sendResult = rendered.markdown
+          ? await deliverResponse(
+            adapter,
+            msg.address,
+            rendered.text,
+            binding.codepilotSessionId,
+            msg.messageId,
+          )
+          : await deliver(adapter, {
+            address: msg.address,
+            text: rendered.text,
+            parseMode: 'plain',
+            replyToMessageId: msg.messageId,
+          }, { sessionId: binding.codepilotSessionId });
+
+        if (sendResult.ok && sendResult.messageId) {
+          toolStatusMessages.set(block.id, {
+            messageId: sendResult.messageId,
+            name: block.name,
+            input: block.input,
+          });
+        }
+        return;
+      }
+
+      if (block.type === 'tool_result') {
+        const existing = toolStatusMessages.get(block.tool_use_id);
+        if (existing) {
+          const rendered = renderToolStatusMessage(
+            existing.name,
+            block.is_error ? 'error' : 'success',
+            existing.input,
+          );
+
+          if (adapter.editMessage) {
+            const editResult = await adapter.editMessage(
+              msg.address.chatId,
+              existing.messageId,
+              rendered.text,
+              rendered.markdown ? 'Markdown' : 'plain',
+            );
+            if (!editResult.ok) {
+              console.warn(
+                '[bridge-manager] Tool status update failed:',
+                editResult.error || 'unknown error',
+              );
+            }
+            return;
+          }
+
+          const fallbackResult = rendered.markdown
+            ? await deliverResponse(
+              adapter,
+              msg.address,
+              rendered.text,
+              binding.codepilotSessionId,
+              msg.messageId,
+            )
+            : await deliver(adapter, {
+              address: msg.address,
+              text: rendered.text,
+              parseMode: 'plain',
+              replyToMessageId: msg.messageId,
+            }, { sessionId: binding.codepilotSessionId });
+          if (!fallbackResult.ok) {
+            console.warn(
+              '[bridge-manager] Tool status fallback delivery failed:',
+              fallbackResult.error || 'unknown error',
+            );
+          }
+          return;
+        }
+      }
+
+      const sendResult = await deliverContentBlock(
+        adapter,
+        msg.address,
+        block,
+        binding.codepilotSessionId,
+        msg.messageId,
+      );
+      if (!sendResult.ok) {
+        console.warn(
+          '[bridge-manager] Incremental part delivery failed:',
+          sendResult.error || 'unknown error',
+        );
+      }
+    });
 
     // Finalize streaming card if adapter supports it.
     // onStreamEnd awaits any in-flight card creation and returns true if a card
@@ -725,7 +944,9 @@ async function handleMessage(
     // Skip if streaming card was finalized (content already in card).
     if (result.responseText) {
       if (!cardFinalized) {
-        await deliverResponse(adapter, msg.address, result.responseText, binding.codepilotSessionId, msg.messageId);
+        if (!incrementalParts) {
+          await deliverResponse(adapter, msg.address, result.responseText, binding.codepilotSessionId, msg.messageId);
+        }
       }
     } else if (result.hasError) {
       const errorResponse: OutboundMessage = {
