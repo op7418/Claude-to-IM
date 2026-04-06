@@ -483,6 +483,7 @@ export class FeishuAdapter extends BaseChannelAdapter {
 
   /**
    * Flush pending card update to Feishu API.
+   * Uses card.update (SDK v1 API format) - card.data must be JSON string.
    */
   private flushCardUpdate(chatId: string): void {
     const state = this.activeCards.get(chatId);
@@ -491,17 +492,26 @@ export class FeishuAdapter extends BaseChannelAdapter {
     const content = buildStreamingContent(state.pendingText || '', state.toolCalls);
 
     state.sequence++;
-    const seq = state.sequence;
     const cardId = state.cardId;
 
-    // Fire-and-forget — streaming updates are non-critical
-    (this.restClient as any).cardkit.v2.card.streamContent({
+    // Use card.update (SDK v1 API format) - card.data must be JSON string
+    (this.restClient as any).cardkit.v1.card.update({
       path: { card_id: cardId },
-      data: { content, sequence: seq },
+      data: {
+        card: {
+          type: 'card_json',
+          data: JSON.stringify({
+            schema: '2.0',
+            config: { wide_screen_mode: true },
+            body: { elements: [{ tag: 'markdown', content, text_align: 'left', text_size: 'normal', element_id: 'streaming_content' }] },
+          }),
+        },
+        sequence: state.sequence,
+      },
     }).then(() => {
       state.lastUpdateAt = Date.now();
     }).catch((err: unknown) => {
-      console.warn('[feishu-adapter] streamContent failed:', err instanceof Error ? err.message : err);
+      console.warn('[feishu-adapter] card.update failed:', err instanceof Error ? err.message : err);
     });
   }
 
@@ -517,7 +527,8 @@ export class FeishuAdapter extends BaseChannelAdapter {
   }
 
   /**
-   * Finalize the streaming card: close streaming mode, update with final content + footer.
+   * Finalize the streaming card: update with final content + footer.
+   * Uses card.update (SDK v1 API format) - card.data must be JSON string.
    */
   private async finalizeCard(
     chatId: string,
@@ -540,14 +551,7 @@ export class FeishuAdapter extends BaseChannelAdapter {
     }
 
     try {
-      // Step 1: Close streaming mode
-      state.sequence++;
-      await (this.restClient as any).cardkit.v2.card.settings.streamingMode.set({
-        path: { card_id: state.cardId },
-        data: { streaming_mode: false, sequence: state.sequence },
-      });
-
-      // Step 2: Build and apply final card
+      // Build final card with footer
       const statusLabels: Record<string, string> = {
         completed: '✅ Completed',
         interrupted: '⚠️ Interrupted',
@@ -562,9 +566,16 @@ export class FeishuAdapter extends BaseChannelAdapter {
       const finalCardJson = buildFinalCardJson(responseText, state.toolCalls, footer);
 
       state.sequence++;
-      await (this.restClient as any).cardkit.v2.card.update({
+      // Use card.update (SDK v1 API format) - card.data must be JSON string
+      await (this.restClient as any).cardkit.v1.card.update({
         path: { card_id: state.cardId },
-        data: { type: 'card_json', data: finalCardJson, sequence: state.sequence },
+        data: {
+          card: {
+            type: 'card_json',
+            data: finalCardJson,
+          },
+          sequence: state.sequence,
+        },
       });
 
       console.log(`[feishu-adapter] Card finalized: cardId=${state.cardId}, status=${status}, elapsed=${formatElapsed(elapsedMs)}`);
