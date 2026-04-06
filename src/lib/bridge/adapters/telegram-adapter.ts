@@ -206,6 +206,31 @@ export class TelegramAdapter extends BaseChannelAdapter {
     return callTelegramApi(token, 'sendMessage', params);
   }
 
+  async editMessage(
+    chatId: string,
+    messageId: string,
+    text: string,
+    parseMode?: OutboundMessage['parseMode'],
+  ): Promise<SendResult> {
+    const token = this.botToken;
+    if (!token) return { ok: false, error: 'No bot token configured' };
+
+    const params: Record<string, unknown> = {
+      chat_id: chatId,
+      message_id: Number(messageId),
+      text,
+      disable_web_page_preview: true,
+    };
+
+    if (parseMode === 'HTML') {
+      params.parse_mode = 'HTML';
+    } else if (parseMode === 'Markdown') {
+      params.parse_mode = 'Markdown';
+    }
+
+    return callTelegramApi(token, 'editMessageText', params);
+  }
+
   async answerCallback(callbackQueryId: string, text?: string): Promise<void> {
     const token = this.botToken;
     if (!token) return;

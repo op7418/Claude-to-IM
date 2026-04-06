@@ -45,8 +45,16 @@ export type OnPartialText = (fullText: string) => void;
  */
 export type OnToolEvent = (toolId: string, toolName: string, status: 'running' | 'complete' | 'error') => void;
 
+/**
+ * Callback invoked when a content block is finalized during stream consumption.
+ * Used by bridge-manager to forward text/tool blocks incrementally to channels
+ * that do not support native streaming previews.
+ */
+export type OnContentBlock = (block: MessageContentBlock) => Promise<void>;
+
 export interface ConversationResult {
   responseText: string;
+  responseParts: MessageContentBlock[];
   tokenUsage: TokenUsage | null;
   hasError: boolean;
   errorMessage: string;
@@ -68,6 +76,7 @@ export async function processMessage(
   files?: FileAttachment[],
   onPartialText?: OnPartialText,
   onToolEvent?: OnToolEvent,
+  onContentBlock?: OnContentBlock,
 ): Promise<ConversationResult> {
   const { store, llm } = getBridgeContext();
   const sessionId = binding.codepilotSessionId;
@@ -78,6 +87,7 @@ export async function processMessage(
   if (!lockAcquired) {
     return {
       responseText: '',
+      responseParts: [],
       tokenUsage: null,
       hasError: true,
       errorMessage: 'Session is busy processing another request',
@@ -184,7 +194,7 @@ export async function processMessage(
     // Consume the stream server-side (replicate collectStreamResponse pattern).
     // Permission requests are forwarded immediately via the callback during streaming
     // because the stream blocks until permission is resolved — we can't wait until after.
-    return await consumeStream(stream, sessionId, onPermissionRequest, onPartialText, onToolEvent);
+    return await consumeStream(stream, sessionId, onPermissionRequest, onPartialText, onToolEvent, onContentBlock);
   } finally {
     clearInterval(renewalInterval);
     store.releaseSessionLock(sessionId, lockId);
@@ -202,6 +212,7 @@ async function consumeStream(
   onPermissionRequest?: OnPermissionRequest,
   onPartialText?: OnPartialText,
   onToolEvent?: OnToolEvent,
+  onContentBlock?: OnContentBlock,
 ): Promise<ConversationResult> {
   const { store } = getBridgeContext();
   const reader = stream.getReader();
@@ -217,6 +228,16 @@ async function consumeStream(
   let capturedSdkSessionId: string | null = null;
 
   try {
+    const flushCurrentText = async (): Promise<void> => {
+      if (!currentText.trim()) return;
+      const textBlock: MessageContentBlock = { type: 'text', text: currentText };
+      contentBlocks.push(textBlock);
+      currentText = '';
+      if (onContentBlock) {
+        await onContentBlock(textBlock);
+      }
+    };
+
     while (true) {
       const { done, value } = await reader.read();
       if (done) break;
@@ -242,18 +263,19 @@ async function consumeStream(
             break;
 
           case 'tool_use': {
-            if (currentText.trim()) {
-              contentBlocks.push({ type: 'text', text: currentText });
-              currentText = '';
-            }
+            await flushCurrentText();
             try {
               const toolData = JSON.parse(event.data);
-              contentBlocks.push({
+              const toolBlock: MessageContentBlock = {
                 type: 'tool_use',
                 id: toolData.id,
                 name: toolData.name,
                 input: toolData.input,
-              });
+              };
+              contentBlocks.push(toolBlock);
+              if (onContentBlock) {
+                await onContentBlock(toolBlock);
+              }
               if (onToolEvent) {
                 try { onToolEvent(toolData.id, toolData.name, 'running'); } catch { /* non-critical */ }
               }
@@ -264,7 +286,7 @@ async function consumeStream(
           case 'tool_result': {
             try {
               const resultData = JSON.parse(event.data);
-              const newBlock = {
+              const newBlock: MessageContentBlock = {
                 type: 'tool_result' as const,
                 tool_use_id: resultData.tool_use_id,
                 content: resultData.content,
@@ -278,6 +300,9 @@ async function consumeStream(
               } else {
                 seenToolResultIds.add(resultData.tool_use_id);
                 contentBlocks.push(newBlock);
+              }
+              if (onContentBlock) {
+                await onContentBlock(newBlock);
               }
               if (onToolEvent) {
                 try {
@@ -361,9 +386,7 @@ async function consumeStream(
     }
 
     // Flush remaining text
-    if (currentText.trim()) {
-      contentBlocks.push({ type: 'text', text: currentText });
-    }
+    await flushCurrentText();
 
     // Save assistant message
     if (contentBlocks.length > 0) {
@@ -392,6 +415,7 @@ async function consumeStream(
 
     return {
       responseText,
+      responseParts: contentBlocks,
       tokenUsage,
       hasError,
       errorMessage,
@@ -424,6 +448,7 @@ async function consumeStream(
 
     return {
       responseText: '',
+      responseParts: contentBlocks,
       tokenUsage,
       hasError: true,
       errorMessage: isAbort ? 'Task stopped by user' : (e instanceof Error ? e.message : 'Stream consumption error'),
