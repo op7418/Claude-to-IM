@@ -131,6 +131,98 @@ describe('bridge-manager lifecycle', () => {
     assert.equal(status.running, false);
     assert.equal(status.adapters.length, 0);
   });
+
+  it('returns an explicit busy reply instead of silently queueing same-session follow-ups', async () => {
+    const store = createMinimalStore({ remote_bridge_enabled: 'false' });
+    initBridgeContext({
+      store,
+      llm: { streamChat: () => new ReadableStream() },
+      permissions: { resolvePendingPermission: () => false },
+      lifecycle: {},
+    });
+
+    const sent: string[] = [];
+    const adapter = {
+      channelType: 'weixin',
+      send: async (message: { text: string }) => {
+        sent.push(message.text);
+        return { ok: true, messageId: 'busy-msg' };
+      },
+      acknowledgeUpdate: () => {},
+    } as any;
+
+    const { _testOnly, getStatus } = await import('../../lib/bridge/bridge-manager');
+    getStatus();
+    const state = (globalThis as Record<string, any>)['__bridge_manager__'];
+    state.activeTasks.set('session-1', {
+      abortController: new AbortController(),
+      startedAt: Date.now() - 30_000,
+      lastActivityAt: Date.now() - 5_000,
+    });
+
+    const handled = await _testOnly.maybeHandleBusySession(adapter, {
+      messageId: 'm-1',
+      address: { channelType: 'weixin', chatId: 'chat-1', userId: 'u-1' },
+      text: 'still there?',
+      timestamp: Date.now(),
+    }, 'session-1');
+
+    assert.equal(handled, true);
+    assert.equal(sent.length, 1);
+    assert.match(sent[0], /Current task is still running/);
+    assert.match(sent[0], /\/stop/);
+  });
+
+  it('aborts stale active tasks so the next message can proceed', async () => {
+    const oldStale = process.env.CTI_ACTIVE_TASK_STALE_MS;
+    process.env.CTI_ACTIVE_TASK_STALE_MS = '1000';
+
+    try {
+      const store = createMinimalStore({ remote_bridge_enabled: 'false' });
+      initBridgeContext({
+        store,
+        llm: { streamChat: () => new ReadableStream() },
+        permissions: { resolvePendingPermission: () => false },
+        lifecycle: {},
+      });
+
+      const sent: string[] = [];
+      const adapter = {
+        channelType: 'weixin',
+        send: async (message: { text: string }) => {
+          sent.push(message.text);
+          return { ok: true, messageId: 'stale-msg' };
+        },
+        acknowledgeUpdate: () => {},
+      } as any;
+
+      const { _testOnly, getStatus } = await import('../../lib/bridge/bridge-manager');
+      getStatus();
+      const state = (globalThis as Record<string, any>)['__bridge_manager__'];
+      const abortController = new AbortController();
+      state.activeTasks.set('session-2', {
+        abortController,
+        startedAt: Date.now() - 120_000,
+        lastActivityAt: Date.now() - 90_000,
+      });
+
+      const handled = await _testOnly.maybeHandleBusySession(adapter, {
+        messageId: 'm-2',
+        address: { channelType: 'weixin', chatId: 'chat-2', userId: 'u-2' },
+        text: 'retry this',
+        timestamp: Date.now(),
+      }, 'session-2');
+
+      assert.equal(handled, false);
+      assert.equal(abortController.signal.aborted, true);
+      assert.equal(state.activeTasks.has('session-2'), false);
+      assert.equal(sent.length, 1);
+      assert.match(sent[0], /looked stuck/);
+    } finally {
+      if (oldStale === undefined) delete process.env.CTI_ACTIVE_TASK_STALE_MS;
+      else process.env.CTI_ACTIVE_TASK_STALE_MS = oldStale;
+    }
+  });
 });
 
 function createMinimalStore(settings: Record<string, string> = {}): BridgeStore {

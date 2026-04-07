@@ -160,13 +160,19 @@ interface AdapterMeta {
   lastError: string | null;
 }
 
+interface ActiveTaskState {
+  abortController: AbortController;
+  startedAt: number;
+  lastActivityAt: number;
+}
+
 interface BridgeManagerState {
   adapters: Map<string, BaseChannelAdapter>;
   adapterMeta: Map<string, AdapterMeta>;
   running: boolean;
   startedAt: string | null;
   loopAborts: Map<string, AbortController>;
-  activeTasks: Map<string, AbortController>;
+  activeTasks: Map<string, ActiveTaskState>;
   /** Per-session processing chains for concurrency control */
   sessionLocks: Map<string, Promise<void>>;
   autoStartChecked: boolean;
@@ -210,6 +216,68 @@ function processWithSessionLock(sessionId: string, fn: () => Promise<void>): Pro
     }
   }).catch(() => {});
   return current;
+}
+
+function getActiveTaskStaleMs(): number {
+  const raw = process.env.CTI_ACTIVE_TASK_STALE_MS || process.env.CTI_TASK_STALE_MS;
+  const parsed = raw ? Number(raw) : NaN;
+  return Number.isFinite(parsed) && parsed > 0 ? parsed : 15 * 60_000;
+}
+
+function formatDuration(ms: number): string {
+  const totalSeconds = Math.max(0, Math.floor(ms / 1000));
+  if (totalSeconds < 60) return `${totalSeconds}s`;
+  const minutes = Math.floor(totalSeconds / 60);
+  const seconds = totalSeconds % 60;
+  if (minutes < 60) return seconds > 0 ? `${minutes}m ${seconds}s` : `${minutes}m`;
+  const hours = Math.floor(minutes / 60);
+  const remMinutes = minutes % 60;
+  return remMinutes > 0 ? `${hours}h ${remMinutes}m` : `${hours}h`;
+}
+
+function touchActiveTask(sessionId: string): void {
+  const task = getState().activeTasks.get(sessionId);
+  if (task) {
+    task.lastActivityAt = Date.now();
+  }
+}
+
+async function maybeHandleBusySession(
+  adapter: BaseChannelAdapter,
+  msg: InboundMessage,
+  sessionId: string,
+): Promise<boolean> {
+  const state = getState();
+  const task = state.activeTasks.get(sessionId);
+  if (!task) return false;
+
+  const now = Date.now();
+  const idleMs = now - task.lastActivityAt;
+  const staleMs = getActiveTaskStaleMs();
+
+  if (idleMs >= staleMs) {
+    task.abortController.abort();
+    state.activeTasks.delete(sessionId);
+    await deliver(adapter, {
+      address: msg.address,
+      text: `The previous task looked stuck after ${formatDuration(idleMs)} without progress. I stopped it and will continue with your latest message.`,
+      parseMode: 'plain',
+      replyToMessageId: msg.messageId,
+    });
+    return false;
+  }
+
+  await deliver(adapter, {
+    address: msg.address,
+    text: `Current task is still running (${formatDuration(now - task.startedAt)} elapsed, last progress ${formatDuration(idleMs)} ago). Send /stop to interrupt it or /new to start a fresh session.`,
+    parseMode: 'plain',
+    replyToMessageId: msg.messageId,
+  });
+
+  if (msg.updateId != null && adapter.acknowledgeUpdate) {
+    adapter.acknowledgeUpdate(msg.updateId);
+  }
+  return true;
 }
 
 /**
@@ -400,6 +468,9 @@ function runAdapterLoop(adapter: BaseChannelAdapter): void {
           await handleMessage(adapter, msg);
         } else {
           const binding = router.resolve(msg.address);
+          if (await maybeHandleBusySession(adapter, msg, binding.codepilotSessionId)) {
+            continue;
+          }
           // Fire-and-forget into session lock — loop continues to accept
           // messages for other sessions immediately.
           processWithSessionLock(binding.codepilotSessionId, () =>
@@ -595,7 +666,11 @@ async function handleMessage(
   // Create an AbortController so /stop can cancel this task externally
   const taskAbort = new AbortController();
   const state = getState();
-  state.activeTasks.set(binding.codepilotSessionId, taskAbort);
+  state.activeTasks.set(binding.codepilotSessionId, {
+    abortController: taskAbort,
+    startedAt: Date.now(),
+    lastActivityAt: Date.now(),
+  });
 
   // ── Streaming preview setup ──────────────────────────────────
   let previewState: StreamingPreviewState | null = null;
@@ -670,7 +745,9 @@ async function handleMessage(
     try { adapter.onStreamText!(msg.address.chatId, fullText); } catch { /* non-critical */ }
   } : undefined;
 
-  const onToolEvent = hasStreamingCards ? (toolId: string, toolName: string, status: 'running' | 'complete' | 'error') => {
+  const onToolEvent = (toolId: string, toolName: string, status: 'running' | 'complete' | 'error') => {
+    touchActiveTask(binding.codepilotSessionId);
+    if (!hasStreamingCards) return;
     if (toolName) {
       toolCallTracker.set(toolId, { id: toolId, name: toolName, status });
     } else {
@@ -681,13 +758,14 @@ async function handleMessage(
     try {
       adapter.onToolEvent!(msg.address.chatId, Array.from(toolCallTracker.values()));
     } catch { /* non-critical */ }
-  } : undefined;
+  };
 
-  // Combined partial text callback: streaming preview + streaming cards
-  const onPartialText = (previewOnPartialText || onStreamCardText) ? (fullText: string) => {
+  // Combined partial text callback: task heartbeat + preview + streaming cards
+  const onPartialText = (fullText: string) => {
+    touchActiveTask(binding.codepilotSessionId);
     if (previewOnPartialText) previewOnPartialText(fullText);
     if (onStreamCardText) onStreamCardText(fullText);
-  } : undefined;
+  };
 
   try {
     // Pass permission callback so requests are forwarded to IM immediately
@@ -696,6 +774,7 @@ async function handleMessage(
     const promptText = text || (hasAttachments ? 'Describe this image.' : '');
 
     const result = await engine.processMessage(binding, promptText, async (perm) => {
+      touchActiveTask(binding.codepilotSessionId);
       await broker.forwardPermissionRequest(
         adapter,
         msg.address,
@@ -836,7 +915,7 @@ async function handleCommand(
       const st = getState();
       const oldTask = st.activeTasks.get(oldBinding.codepilotSessionId);
       if (oldTask) {
-        oldTask.abort();
+        oldTask.abortController.abort();
         st.activeTasks.delete(oldBinding.codepilotSessionId);
       }
 
@@ -932,7 +1011,7 @@ async function handleCommand(
       const st = getState();
       const taskAbort = st.activeTasks.get(binding.codepilotSessionId);
       if (taskAbort) {
-        taskAbort.abort();
+        taskAbort.abortController.abort();
         st.activeTasks.delete(binding.codepilotSessionId);
         response = 'Stopping current task...';
       } else {
@@ -1020,4 +1099,4 @@ export function computeSdkSessionUpdate(
 // Exposed so integration tests can exercise handleMessage directly
 // without wiring up the full adapter loop.
 /** @internal */
-export const _testOnly = { handleMessage };
+export const _testOnly = { handleMessage, maybeHandleBusySession };

@@ -120,6 +120,9 @@ export class FeishuAdapter extends BaseChannelAdapter {
   private activeCards = new Map<string, FeishuCardState>();
   /** In-flight card creation promises per chatId — prevents duplicate creation. */
   private cardCreatePromises = new Map<string, Promise<boolean>>();
+  /** Disable streaming card attempts when CardKit APIs are unavailable. */
+  private cardKitUnavailable = false;
+  private cardKitWarned = false;
 
   // ── Lifecycle ───────────────────────────────────────────────
 
@@ -358,7 +361,18 @@ export class FeishuAdapter extends BaseChannelAdapter {
    * Returns true if card was created successfully.
    */
   private createStreamingCard(chatId: string, replyToMessageId?: string): Promise<boolean> {
-    if (!this.restClient || this.activeCards.has(chatId)) return Promise.resolve(false);
+    if (!this.restClient || this.activeCards.has(chatId) || this.cardKitUnavailable) {
+      return Promise.resolve(false);
+    }
+
+    if (!(this.restClient as any).cardkit?.v2?.card) {
+      this.cardKitUnavailable = true;
+      if (!this.cardKitWarned) {
+        this.cardKitWarned = true;
+        console.warn('[feishu-adapter] CardKit v2 API unavailable; falling back to non-streaming replies');
+      }
+      return Promise.resolve(false);
+    }
 
     // In-flight guard: if creation is already in progress, return the existing promise
     const existing = this.cardCreatePromises.get(chatId);
@@ -372,6 +386,11 @@ export class FeishuAdapter extends BaseChannelAdapter {
 
   private async _doCreateStreamingCard(chatId: string, replyToMessageId?: string): Promise<boolean> {
     if (!this.restClient) return false;
+    const cardApi = (this.restClient as any).cardkit?.v2?.card;
+    if (!cardApi) {
+      this.cardKitUnavailable = true;
+      return false;
+    }
 
     try {
       // Step 1: Create card via CardKit v2
@@ -393,7 +412,7 @@ export class FeishuAdapter extends BaseChannelAdapter {
         },
       };
 
-      const createResp = await (this.restClient as any).cardkit.v2.card.create({
+      const createResp = await cardApi.create({
         data: { type: 'card_json', data: JSON.stringify(cardBody) },
       });
       const cardId = createResp?.data?.card_id;
@@ -487,6 +506,11 @@ export class FeishuAdapter extends BaseChannelAdapter {
   private flushCardUpdate(chatId: string): void {
     const state = this.activeCards.get(chatId);
     if (!state || !this.restClient) return;
+    const cardApi = (this.restClient as any).cardkit?.v2?.card;
+    if (!cardApi) {
+      this.cardKitUnavailable = true;
+      return;
+    }
 
     const content = buildStreamingContent(state.pendingText || '', state.toolCalls);
 
@@ -495,7 +519,7 @@ export class FeishuAdapter extends BaseChannelAdapter {
     const cardId = state.cardId;
 
     // Fire-and-forget — streaming updates are non-critical
-    (this.restClient as any).cardkit.v2.card.streamContent({
+    cardApi.streamContent({
       path: { card_id: cardId },
       data: { content, sequence: seq },
     }).then(() => {
@@ -532,6 +556,12 @@ export class FeishuAdapter extends BaseChannelAdapter {
 
     const state = this.activeCards.get(chatId);
     if (!state || !this.restClient) return false;
+    const cardApi = (this.restClient as any).cardkit?.v2?.card;
+    const streamingModeApi = cardApi?.settings?.streamingMode;
+    if (!cardApi || !streamingModeApi) {
+      this.cardKitUnavailable = true;
+      return false;
+    }
 
     // Clear any pending throttle timer
     if (state.throttleTimer) {
@@ -542,7 +572,7 @@ export class FeishuAdapter extends BaseChannelAdapter {
     try {
       // Step 1: Close streaming mode
       state.sequence++;
-      await (this.restClient as any).cardkit.v2.card.settings.streamingMode.set({
+      await streamingModeApi.set({
         path: { card_id: state.cardId },
         data: { streaming_mode: false, sequence: state.sequence },
       });
@@ -562,7 +592,7 @@ export class FeishuAdapter extends BaseChannelAdapter {
       const finalCardJson = buildFinalCardJson(responseText, state.toolCalls, footer);
 
       state.sequence++;
-      await (this.restClient as any).cardkit.v2.card.update({
+      await cardApi.update({
         path: { card_id: state.cardId },
         data: { type: 'card_json', data: finalCardJson, sequence: state.sequence },
       });
