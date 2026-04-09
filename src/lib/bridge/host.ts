@@ -65,6 +65,33 @@ export interface BridgeApiProvider {
 
 // ── Session & Message types ──────────────────────────────────
 
+/**
+ * CLI Session from ~/.claude/sessions/{pid}.json
+ * Used for bridging terminal sessions to IM channels.
+ */
+export interface CliSession {
+  /** SDK session ID (used for --resume) */
+  sessionId: string;
+  /** Process ID of the CLI session */
+  pid: number;
+  /** Working directory */
+  cwd: string;
+  /** Start timestamp (unix epoch ms) */
+  startedAt: number;
+  /** Session kind (e.g., "interactive") */
+  kind: string;
+  /** Entry point (e.g., "cli") */
+  entrypoint: string;
+  /** Whether the process is still running */
+  isActive: boolean;
+}
+
+/** Extended BridgeSession with optional created_at field. */
+export interface BridgeSessionWithTimestamps extends BridgeSession {
+  /** Creation timestamp (ISO string or unix epoch ms) */
+  created_at?: string | number;
+}
+
 /** Minimal session object returned by the store. */
 export interface BridgeSession {
   id: string;
@@ -197,6 +224,23 @@ export interface BridgeStore {
   // ── Channel offsets (adapter watermarks) ──
   getChannelOffset(key: string): string;
   setChannelOffset(key: string, offset: string): void;
+
+  // ── CLI Session Extensions (optional, for terminal session bridging) ──
+  /** List all CLI sessions from ~/.claude/sessions/ */
+  listCliSessions?(): CliSession[];
+  /** Get a specific CLI session by ID (supports prefix matching) */
+  getCliSession?(sessionId: string): CliSession | null;
+  /** Terminate an active CLI session process */
+  terminateCliSession?(sessionId: string): { success: boolean; reason: string };
+  /** Mark a session as taken over by IM channel (for state synchronization) */
+  markSessionTakenOver?(
+    sdkSessionId: string,
+    channelType: string,
+    chatId: string,
+    displayName?: string,
+  ): void;
+  /** Record bridge activity for CLI resume summary */
+  recordBridgeActivity?(sdkSessionId: string, responseText: string): void;
 }
 
 // ── Host Interface: LLM Provider ─────────────────────────────

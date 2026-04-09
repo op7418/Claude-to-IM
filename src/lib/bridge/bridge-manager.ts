@@ -7,7 +7,15 @@
  * Uses globalThis to survive Next.js HMR in development.
  */
 
-import type { BridgeStatus, InboundMessage, OutboundMessage, StreamingPreviewState, ToolCallInfo } from './types.js';
+import type {
+  BridgeStatus,
+  InboundMessage,
+  OutboundMessage,
+  StreamingPreviewState,
+  ToolCallInfo,
+  CliSession,
+  BridgeSessionWithTimestamps,
+} from './types.js';
 import { createAdapter, getRegisteredTypes } from './channel-adapter.js';
 import type { BaseChannelAdapter } from './channel-adapter.js';
 // Side-effect import: triggers self-registration of all adapter factories
@@ -29,6 +37,235 @@ import {
 } from './security/validators.js';
 
 const GLOBAL_KEY = '__bridge_manager__';
+
+// ── Constants ─────────────────────────────────────────────────────
+
+/** Maximum number of sessions to display in /sessions command */
+const MAX_SESSIONS_TO_DISPLAY = 15;
+
+/** Default user name for home directory display */
+const DEFAULT_USER_NAME = process.env.USER || process.env.USERNAME || 'user';
+
+// ── Shared Types ──────────────────────────────────────────────────
+
+/** Unified session item for /sessions and /switch commands */
+interface UnifiedSessionItem {
+  type: 'bridge' | 'cli';
+  /** ID used for /bind or /switch */
+  id: string;
+  /** SDK session ID for claude --resume */
+  sdkSessionId: string;
+  /** Working directory */
+  cwd: string;
+  /** Whether session is active/running */
+  isActive: boolean;
+  /** Start timestamp for sorting */
+  startedAt: number;
+}
+
+// ── Shared Functions ──────────────────────────────────────────────
+
+/**
+ * Build a unified session list combining Bridge bindings and CLI sessions.
+ * Used by both /sessions and /switch commands.
+ */
+function buildUnifiedSessionList(
+  channelType: string,
+): UnifiedSessionItem[] {
+  const { store } = getBridgeContext();
+
+  // 1. Get Bridge bindings
+  const bindings = router.listBindings(channelType);
+
+  // 2. Get CLI sessions (if store supports it)
+  const cliSessions = store.listCliSessions ? store.listCliSessions() : [];
+
+  const items: UnifiedSessionItem[] = [];
+
+  // Add Bridge bindings
+  for (const b of bindings) {
+    // Get startedAt from BridgeSession if available
+    const session = store.getSession(b.codepilotSessionId);
+    const sessionWithTs = session as BridgeSessionWithTimestamps | null;
+    items.push({
+      type: 'bridge',
+      id: b.codepilotSessionId,
+      sdkSessionId: b.sdkSessionId,
+      cwd: b.workingDirectory,
+      isActive: b.active,
+      startedAt: sessionWithTs?.created_at
+        ? new Date(sessionWithTs.created_at).getTime()
+        : new Date(b.createdAt || 0).getTime(),
+    });
+  }
+
+  // Add CLI sessions
+  for (const c of cliSessions) {
+    items.push({
+      type: 'cli',
+      id: c.sessionId,
+      sdkSessionId: c.sessionId,
+      cwd: c.cwd,
+      isActive: c.isActive,
+      startedAt: c.startedAt,
+    });
+  }
+
+  // Sort by startedAt descending (newest first)
+  items.sort((a, b) => b.startedAt - a.startedAt);
+
+  return items;
+}
+
+/**
+ * Extract short directory name from a path.
+ * Returns the last component, or DEFAULT_USER_NAME for home directory.
+ */
+function getShortPathName(cwd: string): string {
+  if (!cwd || cwd === '~' || cwd === process.env.HOME) {
+    return DEFAULT_USER_NAME;
+  }
+  const parts = cwd.split('/').filter(Boolean);
+  return parts[parts.length - 1] || '~';
+}
+
+// ── Chinese Keyword Command Mapping ─────────────────────────────
+// 中文关键词命令映射表，支持移动端无需切换键盘输入命令
+
+/**
+ * 中文关键词到命令的映射
+ * 支持完整短语、简写和同义词
+ */
+const CHINESE_COMMAND_MAP: Record<string, { command: string; needsArgs?: boolean; argHint?: string }> = {
+  // 会话列表
+  '会话列表': { command: '/sessions' },
+  '会话': { command: '/sessions' },
+  '列表': { command: '/sessions' },
+  'sessions': { command: '/sessions' },
+
+  // 绑定/切换/接管
+  '绑定': { command: '/bind', needsArgs: true, argHint: '<session_id>' },
+  '切换': { command: '/bind', needsArgs: true, argHint: '<session_id>' },
+  '接管': { command: '/bind', needsArgs: true, argHint: '<session_id>' },
+  'bind': { command: '/bind', needsArgs: true },
+
+  // 新会话
+  '新会话': { command: '/new' },
+  '新开': { command: '/new' },
+  '新建': { command: '/new' },
+  'new': { command: '/new' },
+
+  // 工作目录
+  '目录': { command: '/cwd', needsArgs: true, argHint: '<path>' },
+  '工作目录': { command: '/cwd', needsArgs: true, argHint: '<path>' },
+  'cwd': { command: '/cwd', needsArgs: true },
+
+  // 模式
+  '模式': { command: '/mode', needsArgs: true, argHint: 'plan|code|ask' },
+  '切换模式': { command: '/mode', needsArgs: true, argHint: 'plan|code|ask' },
+  'mode': { command: '/mode', needsArgs: true },
+
+  // 状态
+  '状态': { command: '/status' },
+  '当前状态': { command: '/status' },
+  'status': { command: '/status' },
+
+  // 帮助
+  '帮助': { command: '/help' },
+  'help': { command: '/help' },
+  '命令': { command: '/help' },
+  '指令': { command: '/help' },
+
+  // 停止
+  '停止': { command: '/stop' },
+  '取消': { command: '/stop' },
+  'stop': { command: '/stop' },
+
+  // 终止 CLI 进程
+  '终止': { command: '/terminate' },
+  '结束': { command: '/terminate' },
+  '杀掉': { command: '/terminate' },
+  'terminate': { command: '/terminate' },
+};
+
+/**
+ * 模式关键词映射（用于 /mode 命令的中文参数）
+ */
+const MODE_KEYWORDS: Record<string, string> = {
+  '计划': 'plan',
+  '规划': 'plan',
+  '代码': 'code',
+  '编码': 'code',
+  '询问': 'ask',
+  '问答': 'ask',
+};
+
+/**
+ * 解析中文关键词命令
+ * 返回解析后的命令和参数，或 null 如果不是命令
+ */
+function parseChineseCommand(text: string): { command: string; args: string } | null {
+  // NFKC 规范化（处理全角字符），并移除零宽字符
+  const normalized = text.normalize('NFKC')
+    .replace(/[\u200B-\u200D\uFEFF]/g, '')
+    .trim();
+
+  // 尝试精确匹配（完整匹配或关键词 + 空格）
+  for (const [keyword, mapping] of Object.entries(CHINESE_COMMAND_MAP)) {
+    if (normalized === keyword || normalized.startsWith(keyword + ' ')) {
+      const args = normalized.slice(keyword.length).trim();
+
+      // 检查是否需要参数但没有提供
+      if (mapping.needsArgs && !args) {
+        return { command: mapping.command, args: '' };
+      }
+
+      // 特殊处理：模式命令的中文参数转换
+      if (mapping.command === '/mode' && args) {
+        const modeMatch = MODE_KEYWORDS[args];
+        if (modeMatch) {
+          return { command: mapping.command, args: modeMatch };
+        }
+      }
+
+      return { command: mapping.command, args };
+    }
+  }
+
+  // 尝试模糊匹配（处理口语化表达）
+  const fuzzyPatterns: { pattern: RegExp; command: string; isMode?: boolean }[] = [
+    // 切换/绑定相关
+    { pattern: /^(?:帮我\s*)?(?:切换|绑定|接管)(?:到|会话)?\s*([a-f0-9\-]+)\s*(?:会话)?$/i, command: '/bind' },
+    { pattern: /^(?:帮我\s*)?切换到\s*(\S+)\s*会话$/i, command: '/bind' },
+
+    // 目录相关
+    { pattern: /^(?:切换|更改)(?:工作)?目录(?:到)?\s*(\S+)$/i, command: '/cwd' },
+    { pattern: /^(?:工作)?目录(?:设为)?\s*(\S+)$/i, command: '/cwd' },
+
+    // 模式相关
+    { pattern: /^切换?(?:到)?\s*(计划|规划|代码|编码|询问|问答)(?:模式)?$/i, command: '/mode', isMode: true },
+    { pattern: /^进入\s*(计划|规划|代码|编码|询问|问答)(?:模式)?$/i, command: '/mode', isMode: true },
+  ];
+
+  for (const fp of fuzzyPatterns) {
+    const match = normalized.match(fp.pattern);
+    if (match) {
+      let args = match[1] || '';
+
+      // 模式转换
+      if (fp.isMode && args) {
+        const modeMatch = MODE_KEYWORDS[args];
+        if (modeMatch) {
+          args = modeMatch;
+        }
+      }
+
+      return { command: fp.command, args };
+    }
+  }
+
+  return null;
+}
 
 // ── Streaming preview helpers ──────────────────────────────────
 
@@ -564,6 +801,43 @@ async function handleMessage(
     }
   }
 
+  // ── Chinese Keyword Command Parsing ──
+  // Parse Chinese keywords before slash commands for mobile convenience
+  const chineseCmd = parseChineseCommand(rawText);
+  if (chineseCmd) {
+    const { store } = getBridgeContext();
+    const fullCommand = chineseCmd.args
+      ? `${chineseCmd.command} ${chineseCmd.args}`
+      : chineseCmd.command;
+
+    // Check if command needs arguments but none provided
+    const mapping = Object.values(CHINESE_COMMAND_MAP).find(
+      m => m.command === chineseCmd.command && m.needsArgs
+    );
+
+    if (mapping && !chineseCmd.args) {
+      // Need arguments but none provided - show usage hint
+      const argHint = mapping.argHint || '<arguments>';
+      const response = `用法: <code>${chineseCmd.command} ${argHint}</code>\n\n示例：\n- <code>${chineseCmd.command} abc123</code>`;
+      await deliver(adapter, {
+        address: msg.address,
+        text: response,
+        parseMode: 'HTML',
+        replyToMessageId: msg.messageId,
+      });
+      ack();
+      return;
+    }
+
+    // Log the parsed command
+    console.log(`[bridge-manager] Chinese command parsed: "${rawText}" -> "${fullCommand}"`);
+
+    // Route to standard command handler
+    await handleCommand(adapter, msg, fullCommand);
+    ack();
+    return;
+  }
+
   // Check for IM commands (before sanitization — commands are validated individually)
   if (rawText.startsWith('/')) {
     await handleCommand(adapter, msg, rawText);
@@ -748,6 +1022,16 @@ async function handleMessage(
         }
       } catch { /* best effort */ }
     }
+
+    // Record bridge activity for CLI session synchronization
+    // This allows the CLI to show a summary when resuming.
+    if (binding.sdkSessionId && result.responseText && store.recordBridgeActivity) {
+      try {
+        store.recordBridgeActivity(binding.sdkSessionId, result.responseText);
+      } catch {
+        // Best effort - don't fail the whole message handling
+      }
+    }
   } finally {
     // Clean up preview state
     if (previewState) {
@@ -817,16 +1101,30 @@ async function handleCommand(
         '',
         'Send any message to interact with Claude.',
         '',
-        '<b>Commands:</b>',
-        '/new [path] - Start new session',
-        '/bind &lt;session_id&gt; - Bind to existing session',
-        '/cwd /path - Change working directory',
-        '/mode plan|code|ask - Change mode',
-        '/status - Show current status',
-        '/sessions - List recent sessions',
-        '/stop - Stop current session',
-        '/perm allow|allow_session|deny &lt;id&gt; - Respond to permission',
-        '/help - Show this help',
+        '<b>命令（支持中文关键词）：</b>',
+        '',
+        '<b>会话管理：</b>',
+        '/sessions, 会话列表, 会话 - 列出所有会话（包括终端启动的）',
+        '/bind &lt;id&gt;, 绑定/切换/接管 &lt;id&gt; - 切换到指定会话',
+        '/new [path], 新会话, 新开, 新建 - 开始新会话',
+        '/terminate, 终止, 结束, 杀掉 - 终止关联的 CLI 进程',
+        '',
+        '<b>设置：</b>',
+        '/cwd /path, 目录 /path - 更改工作目录',
+        '/mode plan|code|ask, 模式 计划|代码|询问 - 切换模式',
+        '',
+        '<b>其他：</b>',
+        '/status, 状态 - 显示当前状态',
+        '/stop, 停止, 取消 - 停止当前任务',
+        '/help, 帮助, 命令, 指令 - 显示此帮助',
+        '',
+        '<b>移动端快捷：</b>',
+        '权限回复：发送 "1"(允许), "2"(允许会话), "3"(拒绝)',
+        '',
+        '<b>示例：</b>',
+        '"会话列表" → 查看所有会话',
+        '"切换 abc123" → 绑定到会话 abc123',
+        '"模式 计划" → 切换到计划模式',
       ].join('\n');
       break;
 
@@ -863,11 +1161,41 @@ async function handleCommand(
         response = 'Invalid session ID format. Expected a 32-64 character hex/UUID string.';
         break;
       }
+
+      const { store } = getBridgeContext();
+
+      // Check if it's an active CLI session (for warning)
+      let isActiveCliSession = false;
+      if (store.getCliSession) {
+        const cliSession = store.getCliSession(args);
+        isActiveCliSession = !!cliSession && cliSession.isActive;
+      }
+
       const binding = router.bindToSession(msg.address, args);
+
       if (binding) {
-        response = `Bound to session <code>${args.slice(0, 8)}...</code>`;
+        const lines = [];
+        lines.push(`Bound to session <code>${args.slice(0, 8)}...</code>`);
+        lines.push(`CWD: <code>${escapeHtml(binding.workingDirectory || '~')}</code>`);
+
+        // Show sdkSessionId for terminal resume
+        if (binding.sdkSessionId) {
+          lines.push('');
+          lines.push('To resume in terminal:');
+          lines.push(`<code>claude --resume ${binding.sdkSessionId}</code>`);
+        }
+
+        // Warning if CLI session is still active
+        if (isActiveCliSession) {
+          lines.push('');
+          lines.push('<b>⚠️ Warning:</b> This CLI session is still running.');
+          lines.push('Concurrent edits may cause conflicts.');
+          lines.push('Consider closing the terminal session before continuing.');
+        }
+
+        response = lines.join('\n');
       } else {
-        response = 'Session not found.';
+        response = 'Session not found. Use <code>/sessions</code> to list available sessions.';
       }
       break;
     }
@@ -913,16 +1241,143 @@ async function handleCommand(
     }
 
     case '/sessions': {
-      const bindings = router.listBindings(adapter.channelType);
-      if (bindings.length === 0) {
-        response = 'No sessions found.';
+      const { store } = getBridgeContext();
+
+      // Use shared function to build unified session list
+      const items = buildUnifiedSessionList(adapter.channelType);
+
+      // Format output - Beautified version
+      if (items.length === 0) {
+        response = '📋 Sessions\n────────────────────────────\n暂无会话';
       } else {
-        const lines = ['<b>Sessions:</b>', ''];
-        for (const b of bindings.slice(0, 10)) {
-          const active = b.active ? 'active' : 'inactive';
-          lines.push(`<code>${b.codepilotSessionId.slice(0, 8)}...</code> [${active}] ${escapeHtml(b.workingDirectory || '~')}`);
+        const lines: string[] = [];
+        lines.push('📋 <b>Sessions</b>');
+        lines.push('────────────────────────────');
+
+        const currentBinding = store.getChannelBinding(
+          adapter.channelType,
+          msg.address.chatId,
+        );
+
+        // Find current session index
+        // 只检查 codepilotSessionId，不检查 sdkSessionId
+        let currentIndex = -1;
+        for (let i = 0; i < items.length; i++) {
+          const item = items[i];
+          let isCurrent = false;
+          if (currentBinding) {
+            isCurrent = currentBinding.codepilotSessionId === item.id;
+          }
+          if (isCurrent) {
+            currentIndex = i;
+            break;
+          }
         }
+
+        // Display each session
+        const displayedItems = items.slice(0, MAX_SESSIONS_TO_DISPLAY);
+        for (let i = 0; i < displayedItems.length; i++) {
+          const item = displayedItems[i];
+          const displayIndex = i + 1;
+          const shortName = getShortPathName(item.cwd);
+          const typeLabel = item.type === 'bridge' ? 'Bridge' : 'CLI';
+          const idShort = item.id.slice(0, 8);
+
+          // Check if current
+          // 只检查 codepilotSessionId，不检查 sdkSessionId
+          // 当 CLI session 被绑定到 Bridge 后，只有 Bridge session 应该被标记为"当前"
+          let isCurrent = false;
+          if (currentBinding) {
+            isCurrent = currentBinding.codepilotSessionId === item.id;
+          }
+
+          // Status indicator: ● for current, ○ for others
+          const statusIndicator = isCurrent ? '●' : '○';
+          const currentMarker = isCurrent ? ' <b>← 当前</b>' : '';
+
+          // First line: #N ● CLI  shortName ← 当前
+          lines.push(`#${displayIndex} ${statusIndicator} ${typeLabel}  ${shortName}${currentMarker}`);
+
+          // Tree structure
+          lines.push(`├─ 📁 <code>${escapeHtml(item.cwd || '~')}</code>`);
+          lines.push(`└─ 🆔 <code>${idShort}...</code>`);
+        }
+
+        // Footer
+        lines.push('────────────────────────────');
+        lines.push('💡 <b>操作:</b>');
+        lines.push('• 切换会话: <code>/switch #N</code> (例如: <code>/switch #1</code>)');
+        lines.push('• 终端恢复: <code>/bind #N</code> (显示完整 resume ID)');
+
         response = lines.join('\n');
+      }
+      break;
+    }
+
+    case '/switch': {
+      // Switch session by index number (e.g., /switch #1 or /switch 1)
+      if (!args) {
+        response = 'Usage: <code>/switch #N</code> 或 <code>/switch N</code> (例如: <code>/switch #1</code>)';
+        break;
+      }
+
+      // Parse index number
+      // Accept formats: #1, # 1, 1, /switch 1
+      let indexMatch = args.match(/#?\s*(\d+)/);
+      if (!indexMatch) {
+        response = '无效的序号格式。使用方法: <code>/switch #N</code> (例如: <code>/switch #1</code>)';
+        break;
+      }
+
+      const index = parseInt(indexMatch[1], 10);
+      if (index < 1) {
+        response = '序号必须大于 0';
+        break;
+      }
+
+      // Use shared function to build unified session list (same as /sessions)
+      const items = buildUnifiedSessionList(adapter.channelType);
+
+      // Check if index is valid
+      if (index > items.length) {
+        response = `序号 #${index} 超出范围。当前共有 ${items.length} 个会话。`;
+        break;
+      }
+
+      const targetItem = items[index - 1];
+
+      // Check if it's an active CLI session (for warning)
+      let isActiveCliSession = targetItem.type === 'cli' && targetItem.isActive;
+
+      // Bind to this session
+      const binding = router.bindToSession(msg.address, targetItem.id);
+
+      if (binding) {
+        const lines = [];
+        lines.push(`<b>✅ 已切换到会话 #${index}</b>`);
+        lines.push('');
+        lines.push(`类型: ${targetItem.type === 'bridge' ? 'Bridge' : 'CLI'}`);
+        lines.push(`工作目录: <code>${escapeHtml(binding.workingDirectory || '~')}</code>`);
+        lines.push(`会话ID: <code>${targetItem.id.slice(0, 8)}...</code>`);
+
+        // Show sdkSessionId for terminal resume
+        if (binding.sdkSessionId) {
+          lines.push('');
+          lines.push('💡 终端恢复命令:');
+          lines.push(`<code>claude --resume ${binding.sdkSessionId}</code>`);
+        }
+
+        // Warning if CLI session is still active
+        if (isActiveCliSession) {
+          lines.push('');
+          lines.push('<b>⚠️ 警告:</b> 此 CLI 会话仍在运行中。');
+          lines.push('同时操作可能导致冲突，建议先关闭终端会话。');
+          lines.push('或使用 <code>/terminate</code> 终止终端进程。');
+        }
+
+        response = lines.join('\n');
+      } else {
+        response = `无法绑定到会话 #${index}。`;
       }
       break;
     }
@@ -937,6 +1392,58 @@ async function handleCommand(
         response = 'Stopping current task...';
       } else {
         response = 'No task is currently running.';
+      }
+      break;
+    }
+
+    case '/terminate': {
+      const { store } = getBridgeContext();
+      const binding = router.resolve(msg.address);
+
+      // Check if we have a CLI session to terminate
+      if (!binding.sdkSessionId) {
+        response = 'This session is not linked to a CLI session. Use /sessions to see available CLI sessions.';
+        break;
+      }
+
+      // Check if store has terminate capability
+      if (!store.terminateCliSession) {
+        response = 'Session termination is not available in this configuration.';
+        break;
+      }
+
+      // Check if CLI session is still active
+      let isActive = false;
+      if (store.getCliSession) {
+        const cliSession = store.getCliSession(binding.sdkSessionId);
+        isActive = cliSession?.isActive ?? false;
+      }
+
+      if (!isActive) {
+        response = 'The CLI session is no longer running. No termination needed.';
+        break;
+      }
+
+      // Attempt to terminate
+      const result = store.terminateCliSession(binding.sdkSessionId);
+
+      if (result.success) {
+        response = [
+          '<b>✅ CLI Session Terminated</b>',
+          '',
+          `Reason: ${result.reason}`,
+          '',
+          'The terminal session has been closed.',
+          'You can now safely continue in Feishu.',
+        ].join('\n');
+      } else {
+        response = [
+          '<b>❌ Failed to Terminate</b>',
+          '',
+          `Error: ${result.reason}`,
+          '',
+          'Please close the terminal session manually.',
+        ].join('\n');
       }
       break;
     }
@@ -965,16 +1472,26 @@ async function handleCommand(
       response = [
         '<b>CodePilot Bridge Commands</b>',
         '',
-        '/new [path] - Start new session',
-        '/bind &lt;session_id&gt; - Bind to existing session',
-        '/cwd /path - Change working directory',
-        '/mode plan|code|ask - Change mode',
-        '/status - Show current status',
-        '/sessions - List recent sessions',
-        '/stop - Stop current session',
+        '<b>会话管理：</b>',
+        '/new [path] - Start new session (新会话, 新开, 新建)',
+        '/bind &lt;session_id&gt; - Bind to existing session (绑定, 切换, 接管)',
+        '/sessions - List recent sessions (会话列表, 会话)',
+        '/terminate - Terminate linked CLI process (终止, 结束, 杀掉)',
+        '',
+        '<b>设置：</b>',
+        '/cwd /path - Change working directory (目录, 工作目录)',
+        '/mode plan|code|ask - Change mode (模式, 切换模式)',
+        '',
+        '<b>其他：</b>',
+        '/status - Show current status (状态, 当前状态)',
+        '/stop - Stop current task (停止, 取消)',
         '/perm allow|allow_session|deny &lt;id&gt; - Respond to permission request',
-        '1/2/3 - Quick permission reply (Feishu/QQ/WeChat, single pending)',
-        '/help - Show this help',
+        '1/2/3 - Quick permission reply (Feishu/QQ/WeChat)',
+        '/help - Show this help (帮助, 命令, 指令)',
+        '',
+        '<b>提示：</b>',
+        '所有命令都支持中文关键词，无需输入斜杠。',
+        '例如：输入 "会话列表" 等同于 /sessions',
       ].join('\n');
       break;
 
