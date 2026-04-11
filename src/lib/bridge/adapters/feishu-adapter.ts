@@ -411,7 +411,7 @@ export class FeishuAdapter extends BaseChannelAdapter {
         },
       };
 
-      const createResp = await (this.restClient as any).cardkit.v2.card.create({
+      const createResp = await (this.restClient as any).cardkit.v1.card.create({
         data: { type: 'card_json', data: JSON.stringify(cardBody) },
       });
       const cardId = createResp?.data?.card_id;
@@ -513,8 +513,8 @@ export class FeishuAdapter extends BaseChannelAdapter {
     const cardId = state.cardId;
 
     // Fire-and-forget — streaming updates are non-critical
-    (this.restClient as any).cardkit.v2.card.streamContent({
-      path: { card_id: cardId },
+    (this.restClient as any).cardkit.v1.cardElement.content({
+      path: { card_id: cardId, element_id: 'streaming_content' },
       data: { content, sequence: seq },
     }).then(() => {
       state.lastUpdateAt = Date.now();
@@ -560,9 +560,9 @@ export class FeishuAdapter extends BaseChannelAdapter {
     try {
       // Step 1: Close streaming mode
       state.sequence++;
-      await (this.restClient as any).cardkit.v2.card.settings.streamingMode.set({
+      await (this.restClient as any).cardkit.v1.card.settings({
         path: { card_id: state.cardId },
-        data: { streaming_mode: false, sequence: state.sequence },
+        data: { settings: JSON.stringify({ streaming_mode: false }), sequence: state.sequence },
       });
 
       // Step 2: Build and apply final card
@@ -580,9 +580,9 @@ export class FeishuAdapter extends BaseChannelAdapter {
       const finalCardJson = buildFinalCardJson(responseText, state.toolCalls, footer);
 
       state.sequence++;
-      await (this.restClient as any).cardkit.v2.card.update({
+      await (this.restClient as any).cardkit.v1.card.update({
         path: { card_id: state.cardId },
-        data: { type: 'card_json', data: finalCardJson, sequence: state.sequence },
+        data: { card: { type: 'card_json', data: finalCardJson }, sequence: state.sequence },
       });
 
       console.log(`[feishu-adapter] Card finalized: cardId=${state.cardId}, status=${status}, elapsed=${formatElapsed(elapsedMs)}`);
@@ -1158,11 +1158,39 @@ export class FeishuAdapter extends BaseChannelAdapter {
           } catch { /* best effort */ }
         }
       }
-    } else if (messageType === 'file' || messageType === 'audio' || messageType === 'video' || messageType === 'media') {
-      // [P2] Support file/audio/video/media downloads
+    } else if (messageType === 'audio') {
+      // [P2] Voice message → STT via DashScope qwen-omni-turbo
       const fileKey = this.extractFileKey(msg.content);
       if (fileKey) {
-        const resourceType = messageType === 'audio' || messageType === 'video' || messageType === 'media'
+        const attachment = await this.downloadResource(msg.message_id, fileKey, 'audio');
+        if (attachment) {
+          const transcript = await this.transcribeAudio(attachment.data);
+          if (transcript) {
+            text = transcript;
+            console.log(`[feishu-adapter] Voice STT success (${transcript.length} chars): ${transcript.slice(0, 80)}`);
+          } else {
+            // STT failed, fall back to attaching audio file
+            attachments.push(attachment);
+            console.warn('[feishu-adapter] Voice STT failed, falling back to audio attachment');
+          }
+        } else {
+          text = '[audio download failed]';
+          try {
+            getBridgeContext().store.insertAuditLog({
+              channelType: 'feishu',
+              chatId,
+              direction: 'inbound',
+              messageId: msg.message_id,
+              summary: `[ERROR] audio download failed for key: ${fileKey}`,
+            });
+          } catch { /* best effort */ }
+        }
+      }
+    } else if (messageType === 'file' || messageType === 'video' || messageType === 'media') {
+      // [P2] Support file/video/media downloads
+      const fileKey = this.extractFileKey(msg.content);
+      if (fileKey) {
+        const resourceType = messageType === 'video' || messageType === 'media'
           ? messageType
           : 'file';
         const attachment = await this.downloadResource(msg.message_id, fileKey, resourceType);
@@ -1392,6 +1420,69 @@ export class FeishuAdapter extends BaseChannelAdapter {
   private stripMentionMarkers(text: string): string {
     // Feishu uses @_user_N placeholders for mentions
     return text.replace(/@_user_\d+/g, '').trim();
+  }
+
+  // ── Voice STT (Speech-to-Text) ──────────────────────────────
+
+  /**
+   * Transcribe audio (base64-encoded) to text via DashScope qwen-omni-turbo.
+   * Returns the transcript string, or null on failure.
+   */
+  private async transcribeAudio(base64Audio: string): Promise<string | null> {
+    const apiKey = process.env.DASHSCOPE_API_KEY;
+    if (!apiKey) {
+      console.warn('[feishu-adapter] DASHSCOPE_API_KEY not set, cannot transcribe audio');
+      return null;
+    }
+
+    try {
+      const body = JSON.stringify({
+        model: 'qwen-omni-turbo',
+        messages: [{
+          role: 'user',
+          content: [
+            {
+              type: 'input_audio',
+              input_audio: {
+                data: `data:audio/ogg;base64,${base64Audio}`,
+                format: 'ogg',
+              },
+            },
+            {
+              type: 'text',
+              text: '请将这段语音转录为文字，只输出转录文本，不要加任何解释、标点修正或格式。',
+            },
+          ],
+        }],
+        stream: false,
+      });
+
+      const res = await fetch('https://dashscope.aliyuncs.com/compatible-mode/v1/chat/completions', {
+        method: 'POST',
+        headers: {
+          'Authorization': `Bearer ${apiKey}`,
+          'Content-Type': 'application/json',
+        },
+        body,
+      });
+
+      if (!res.ok) {
+        console.error(`[feishu-adapter] STT API error: ${res.status} ${res.statusText}`);
+        return null;
+      }
+
+      const data = await res.json() as {
+        choices?: Array<{ message?: { content?: string } }>;
+      };
+      const transcript = data.choices?.[0]?.message?.content?.trim();
+      return transcript || null;
+    } catch (err) {
+      console.error(
+        '[feishu-adapter] STT transcription failed:',
+        err instanceof Error ? err.message : err,
+      );
+      return null;
+    }
   }
 
   // ── Resource download ───────────────────────────────────────
