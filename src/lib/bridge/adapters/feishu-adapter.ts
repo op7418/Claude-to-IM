@@ -120,6 +120,16 @@ export class FeishuAdapter extends BaseChannelAdapter {
   private activeCards = new Map<string, FeishuCardState>();
   /** In-flight card creation promises per chatId — prevents duplicate creation. */
   private cardCreatePromises = new Map<string, Promise<boolean>>();
+  /**
+   * Feature flag: streaming cards use cardkit.v2 API which is not yet
+   * implemented in @larksuiteoapi/node-sdk (as of v1.61.0). Setting this
+   * to false disables the streaming card path — bridge-manager falls back
+   * to deliverResponse → sendAsCard/sendAsPost (static final reply).
+   * Flip to true once lark SDK ships cardkit.v2 support.
+   */
+  private static readonly STREAMING_CARDS_ENABLED = false;
+  /** One-shot guard so the disabled-streaming notice only logs once per process. */
+  private streamingCardsDisabledLogged = false;
 
   // ── Lifecycle ───────────────────────────────────────────────
 
@@ -267,7 +277,7 @@ export class FeishuAdapter extends BaseChannelAdapter {
     const messageId = this.lastIncomingMessageId.get(chatId);
 
     // Create streaming card (fire-and-forget — fallback to traditional if fails)
-    if (messageId) {
+    if (messageId && FeishuAdapter.STREAMING_CARDS_ENABLED) {
       this.createStreamingCard(chatId, messageId).catch(() => {});
     }
 
@@ -358,6 +368,14 @@ export class FeishuAdapter extends BaseChannelAdapter {
    * Returns true if card was created successfully.
    */
   private createStreamingCard(chatId: string, replyToMessageId?: string): Promise<boolean> {
+    // Hard-disabled until lark SDK supports cardkit.v2. See STREAMING_CARDS_ENABLED.
+    if (!FeishuAdapter.STREAMING_CARDS_ENABLED) {
+      if (!this.streamingCardsDisabledLogged) {
+        console.log('[feishu-adapter] Streaming cards disabled (cardkit.v2 not in lark SDK) — using static replies');
+        this.streamingCardsDisabledLogged = true;
+      }
+      return Promise.resolve(false);
+    }
     if (!this.restClient || this.activeCards.has(chatId)) return Promise.resolve(false);
 
     // In-flight guard: if creation is already in progress, return the existing promise
@@ -604,6 +622,10 @@ export class FeishuAdapter extends BaseChannelAdapter {
    * Creates streaming card on first call, then updates content.
    */
   onStreamText(chatId: string, fullText: string): void {
+    if (!FeishuAdapter.STREAMING_CARDS_ENABLED) {
+      // Streaming disabled — bridge-manager will deliver final text via send()
+      return;
+    }
     if (!this.activeCards.has(chatId)) {
       // Card should have been created by onMessageStart, but create lazily if not
       const messageId = this.lastIncomingMessageId.get(chatId);
@@ -620,6 +642,11 @@ export class FeishuAdapter extends BaseChannelAdapter {
   }
 
   async onStreamEnd(chatId: string, status: 'completed' | 'interrupted' | 'error', responseText: string): Promise<boolean> {
+    if (!FeishuAdapter.STREAMING_CARDS_ENABLED) {
+      // Return false → bridge-manager treats card as NOT finalized
+      // → falls through to deliverResponse (sendAsCard / sendAsPost).
+      return false;
+    }
     return this.finalizeCard(chatId, status, responseText);
   }
 
