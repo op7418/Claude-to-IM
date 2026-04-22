@@ -174,6 +174,7 @@ export interface ToolCallInfo {
   id: string;
   name: string;
   status: 'running' | 'complete' | 'error';
+  input?: Record<string, unknown>;
 }
 
 // ── Config ─────────────────────────────────────────────────────

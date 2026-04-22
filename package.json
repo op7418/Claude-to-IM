@@ -27,7 +27,10 @@
       "import": "./dist/lib/bridge/security/*.js"
     }
   },
-  "files": ["dist", "src/lib"],
+  "files": [
+    "dist",
+    "src/lib"
+  ],
   "scripts": {
     "build": "tsc -p tsconfig.build.json",
     "prepare": "npm run build",
@@ -38,15 +41,15 @@
   },
   "dependencies": {
     "@anthropic-ai/claude-agent-sdk": "^0.2.62",
-    "@larksuiteoapi/node-sdk": "^1.59.0",
+    "@larksuiteoapi/node-sdk": "^1.61.1",
     "discord.js": "^14.25.1",
     "markdown-it": "^14.1.1",
     "ws": "^8.18.0"
   },
   "devDependencies": {
     "@types/markdown-it": "^14.1.2",
-    "@types/ws": "^8.5.0",
     "@types/node": "^22.0.0",
+    "@types/ws": "^8.5.0",
     "tsx": "^4.21.0",
     "typescript": "^5"
   },

@@ -43,7 +43,7 @@ export type OnPartialText = (fullText: string) => void;
  * Callback invoked when tool_use or tool_result SSE events arrive.
  * Used by bridge-manager to forward tool progress to adapters for real-time display.
  */
-export type OnToolEvent = (toolId: string, toolName: string, status: 'running' | 'complete' | 'error') => void;
+export type OnToolEvent = (toolId: string, toolName: string, status: 'running' | 'complete' | 'error', input?: Record<string, unknown>) => void;
 
 export interface ConversationResult {
   responseText: string;
@@ -255,7 +255,7 @@ async function consumeStream(
                 input: toolData.input,
               });
               if (onToolEvent) {
-                try { onToolEvent(toolData.id, toolData.name, 'running'); } catch { /* non-critical */ }
+                try { onToolEvent(toolData.id, toolData.name, 'running', toolData.input); } catch { /* non-critical */ }
               }
             } catch { /* skip */ }
             break;
