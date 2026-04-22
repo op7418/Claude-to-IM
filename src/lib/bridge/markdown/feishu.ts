@@ -99,7 +99,26 @@ export function buildToolProgressMarkdown(tools: ToolCallInfo[]): string {
   if (tools.length === 0) return '';
   const lines = tools.map((tc) => {
     const icon = tc.status === 'running' ? '🔄' : tc.status === 'complete' ? '✅' : '❌';
-    return `${icon} \`${tc.name}\``;
+    let detail = '';
+    if (tc.input) {
+      // Show the most relevant input field per tool
+      const i = tc.input;
+      if (tc.name === 'Bash' && typeof i['command'] === 'string') {
+        const cmd = (i['command'] as string).split('\n')[0].slice(0, 60);
+        detail = ` \`${cmd}${cmd.length < (i['command'] as string).split('\n')[0].length ? '…' : ''}\``;
+      } else if ((tc.name === 'Read' || tc.name === 'Write' || tc.name === 'Edit') && typeof i['file_path'] === 'string') {
+        detail = ` \`${i['file_path']}\``;
+      } else if (tc.name === 'Grep' && typeof i['pattern'] === 'string') {
+        detail = ` \`${i['pattern']}\``;
+      } else if (tc.name === 'Glob' && typeof i['pattern'] === 'string') {
+        detail = ` \`${i['pattern']}\``;
+      } else if (tc.name === 'WebFetch' && typeof i['url'] === 'string') {
+        detail = ` \`${(i['url'] as string).slice(0, 60)}\``;
+      } else if (tc.name === 'WebSearch' && typeof i['query'] === 'string') {
+        detail = ` \`${i['query']}\``;
+      }
+    }
+    return `${icon} **${tc.name}**${detail}`;
   });
   return lines.join('\n');
 }
@@ -121,10 +140,10 @@ export function formatElapsed(ms: number): string {
  * Combines main text content with tool progress.
  */
 export function buildStreamingContent(text: string, tools: ToolCallInfo[]): string {
-  let content = text || '';
+  let content = text ? text.trimEnd() : '';
   const toolMd = buildToolProgressMarkdown(tools);
   if (toolMd) {
-    content = content ? `${content}\n\n${toolMd}` : toolMd;
+    content = content ? `${content}\n\n---\n${toolMd}` : toolMd;
   }
   return content || '💭 Thinking...';
 }
@@ -173,6 +192,10 @@ export function buildFinalCardJson(
   return JSON.stringify({
     schema: '2.0',
     config: { wide_screen_mode: true },
+    header: {
+      title: { tag: 'plain_text', content: '🟢 Answer' },
+      template: 'green',
+    },
     body: { elements },
   });
 }

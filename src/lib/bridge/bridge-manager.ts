@@ -459,13 +459,19 @@ async function handleMessage(
   if (msg.callbackData) {
     const handled = broker.handlePermissionCallback(msg.callbackData, msg.address.chatId, msg.callbackMessageId);
     if (handled) {
-      // Send confirmation
-      const confirmMsg: OutboundMessage = {
-        address: msg.address,
-        text: 'Permission response recorded.',
-        parseMode: 'plain',
-      };
-      await deliver(adapter, confirmMsg);
+      if (adapter.channelType === 'feishu' && msg.callbackMessageId) {
+        // Update permission card to resolved state instead of sending a new message
+        const parts = msg.callbackData.split(':');
+        const action = parts[1] || 'allow';
+        (adapter as import('./adapters/feishu-adapter.js').FeishuAdapter).updatePermissionCardResolved?.(msg.callbackMessageId, action);
+      } else {
+        const confirmMsg: OutboundMessage = {
+          address: msg.address,
+          text: 'Permission response recorded.',
+          parseMode: 'plain',
+        };
+        await deliver(adapter, confirmMsg);
+      }
     }
     ack();
     return;
@@ -670,11 +676,10 @@ async function handleMessage(
     try { adapter.onStreamText!(msg.address.chatId, fullText); } catch { /* non-critical */ }
   } : undefined;
 
-  const onToolEvent = hasStreamingCards ? (toolId: string, toolName: string, status: 'running' | 'complete' | 'error') => {
+  const onToolEvent = hasStreamingCards ? (toolId: string, toolName: string, status: 'running' | 'complete' | 'error', input?: Record<string, unknown>) => {
     if (toolName) {
-      toolCallTracker.set(toolId, { id: toolId, name: toolName, status });
+      toolCallTracker.set(toolId, { id: toolId, name: toolName, status, input });
     } else {
-      // tool_result doesn't carry name — update existing entry's status
       const existing = toolCallTracker.get(toolId);
       if (existing) existing.status = status;
     }
@@ -748,6 +753,7 @@ async function handleMessage(
         }
       } catch { /* best effort */ }
     }
+
   } finally {
     // Clean up preview state
     if (previewState) {

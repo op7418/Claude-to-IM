@@ -36,6 +36,7 @@ import {
   buildStreamingContent,
   buildFinalCardJson,
   buildPermissionButtonCard,
+  buildToolProgressMarkdown,
   formatElapsed,
 } from '../markdown/feishu.js';
 
@@ -384,6 +385,10 @@ export class FeishuAdapter extends BaseChannelAdapter {
           wide_screen_mode: true,
           summary: { content: '思考中...' },
         },
+        header: {
+          title: { tag: 'plain_text', content: '🟢 Answer' },
+          template: 'green',
+        },
         body: {
           elements: [{
             tag: 'markdown',
@@ -391,6 +396,11 @@ export class FeishuAdapter extends BaseChannelAdapter {
             text_align: 'left',
             text_size: 'normal',
             element_id: 'streaming_content',
+          }, {
+            tag: 'markdown',
+            content: '',
+            text_size: 'normal',
+            element_id: 'tool_progress',
           }],
         },
       };
@@ -490,13 +500,12 @@ export class FeishuAdapter extends BaseChannelAdapter {
     const state = this.activeCards.get(chatId);
     if (!state || !this.restClient) return;
 
-    const content = buildStreamingContent(state.pendingText || '', state.toolCalls);
+    const content = preprocessFeishuMarkdown((state.pendingText || '').trimEnd()) || '💭 Thinking...';
 
     state.sequence++;
     const seq = state.sequence;
     const cardId = state.cardId;
 
-    // Fire-and-forget — streaming updates are non-critical
     (this.restClient as any).cardkit.v1.cardElement.content({
       path: { card_id: cardId, element_id: 'streaming_content' },
       data: { content, sequence: seq },
@@ -507,15 +516,22 @@ export class FeishuAdapter extends BaseChannelAdapter {
     });
   }
 
-  /**
-   * Update tool progress in the streaming card.
-   */
   private updateToolProgress(chatId: string, tools: ToolCallInfo[]): void {
     const state = this.activeCards.get(chatId);
-    if (!state) return;
+    if (!state || !this.restClient) return;
     state.toolCalls = tools;
-    // Trigger a content flush with current text + updated tools
-    this.updateCardContent(chatId, state.pendingText || '');
+
+    const toolMd = buildToolProgressMarkdown(tools);
+    state.sequence++;
+    const seq = state.sequence;
+    const cardId = state.cardId;
+
+    (this.restClient as any).cardkit.v1.cardElement.content({
+      path: { card_id: cardId, element_id: 'tool_progress' },
+      data: { content: toolMd || ' ', sequence: seq },
+    }).catch((err: unknown) => {
+      console.warn('[feishu-adapter] toolProgress update failed:', err instanceof Error ? err.message : err);
+    });
   }
 
   /**
@@ -599,6 +615,16 @@ export class FeishuAdapter extends BaseChannelAdapter {
     return this.activeCards.has(chatId);
   }
 
+  /**
+   * Delete a permission card after the user clicks a button.
+   */
+  updatePermissionCardResolved(messageId: string, _action: string): void {
+    if (!this.restClient || !messageId) return;
+    this.restClient.im.message.delete({
+      path: { message_id: messageId },
+    }).catch(() => { /* best effort */ });
+  }
+
   // ── Streaming adapter interface ────────────────────────────────
 
   /**
@@ -646,7 +672,7 @@ export class FeishuAdapter extends BaseChannelAdapter {
 
     // If there are inline buttons (permission prompts), send card with action buttons
     if (message.inlineButtons && message.inlineButtons.length > 0) {
-      return this.sendPermissionCard(message.address.chatId, text, message.inlineButtons);
+      return this.sendPermissionCard(message.address.chatId, text, message.inlineButtons, message.replyToMessageId);
     }
 
     // Rendering strategy (aligned with Openclaw):
@@ -742,6 +768,7 @@ export class FeishuAdapter extends BaseChannelAdapter {
     chatId: string,
     text: string,
     inlineButtons: import('../types.js').InlineButton[][],
+    replyToMessageId?: string,
   ): Promise<SendResult> {
     if (!this.restClient) {
       return { ok: false, error: 'Feishu client not initialized' };
@@ -771,14 +798,18 @@ export class FeishuAdapter extends BaseChannelAdapter {
       const cardJson = buildPermissionButtonCard(mdText, permId, chatId);
 
       try {
-        const res = await this.restClient.im.message.create({
-          params: { receive_id_type: 'chat_id' },
-          data: {
-            receive_id: chatId,
-            msg_type: 'interactive',
-            content: cardJson,
-          },
-        });
+        let res;
+        if (replyToMessageId) {
+          res = await this.restClient.im.message.reply({
+            path: { message_id: replyToMessageId },
+            data: { msg_type: 'interactive', content: cardJson },
+          });
+        } else {
+          res = await this.restClient.im.message.create({
+            params: { receive_id_type: 'chat_id' },
+            data: { receive_id: chatId, msg_type: 'interactive', content: cardJson },
+          });
+        }
         if (res?.data?.message_id) {
           return { ok: true, messageId: res.data.message_id };
         }
