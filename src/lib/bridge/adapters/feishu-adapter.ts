@@ -159,6 +159,8 @@ export class FeishuAdapter extends BaseChannelAdapter {
       'card.action.trigger': (async (data: unknown) => {
         return await this.handleCardAction(data);
       }) as any,
+      'im.message.reaction.created_v1': () => {},
+      'im.message.reaction.deleted_v1': () => {},
     });
 
     // Create and start WSClient
@@ -393,7 +395,7 @@ export class FeishuAdapter extends BaseChannelAdapter {
         },
       };
 
-      const createResp = await (this.restClient as any).cardkit.v2.card.create({
+      const createResp = await (this.restClient as any).cardkit.v1.card.create({
         data: { type: 'card_json', data: JSON.stringify(cardBody) },
       });
       const cardId = createResp?.data?.card_id;
@@ -495,8 +497,8 @@ export class FeishuAdapter extends BaseChannelAdapter {
     const cardId = state.cardId;
 
     // Fire-and-forget — streaming updates are non-critical
-    (this.restClient as any).cardkit.v2.card.streamContent({
-      path: { card_id: cardId },
+    (this.restClient as any).cardkit.v1.cardElement.content({
+      path: { card_id: cardId, element_id: 'streaming_content' },
       data: { content, sequence: seq },
     }).then(() => {
       state.lastUpdateAt = Date.now();
@@ -542,9 +544,9 @@ export class FeishuAdapter extends BaseChannelAdapter {
     try {
       // Step 1: Close streaming mode
       state.sequence++;
-      await (this.restClient as any).cardkit.v2.card.settings.streamingMode.set({
+      await (this.restClient as any).cardkit.v1.card.settings({
         path: { card_id: state.cardId },
-        data: { streaming_mode: false, sequence: state.sequence },
+        data: { settings: JSON.stringify({ streaming_mode: false }), sequence: state.sequence },
       });
 
       // Step 2: Build and apply final card
@@ -562,9 +564,9 @@ export class FeishuAdapter extends BaseChannelAdapter {
       const finalCardJson = buildFinalCardJson(responseText, state.toolCalls, footer);
 
       state.sequence++;
-      await (this.restClient as any).cardkit.v2.card.update({
+      await (this.restClient as any).cardkit.v1.card.update({
         path: { card_id: state.cardId },
-        data: { type: 'card_json', data: finalCardJson, sequence: state.sequence },
+        data: { card: { type: 'card_json', data: finalCardJson }, sequence: state.sequence },
       });
 
       console.log(`[feishu-adapter] Card finalized: cardId=${state.cardId}, status=${status}, elapsed=${formatElapsed(elapsedMs)}`);
