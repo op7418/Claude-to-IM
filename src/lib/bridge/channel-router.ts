@@ -5,8 +5,27 @@
  * the corresponding ChannelBinding (and underlying chat_session).
  */
 
+import fs from 'fs';
+import os from 'os';
+import path from 'path';
 import type { ChannelAddress, ChannelBinding, ChannelType } from './types.js';
 import { getBridgeContext } from './context.js';
+
+const CTI_HOME = process.env.CTI_HOME || path.join(os.homedir(), '.claude-to-im');
+
+/**
+ * Load a per-channel system prompt from `~/.claude-to-im/<channelType>-persona.md`.
+ * Returns undefined if the file does not exist or is empty.
+ */
+function loadChannelPersona(channelType: string): string | undefined {
+  const file = path.join(CTI_HOME, `${channelType}-persona.md`);
+  try {
+    const content = fs.readFileSync(file, 'utf-8').trim();
+    return content || undefined;
+  } catch {
+    return undefined;
+  }
+}
 
 /**
  * Resolve an inbound address to a ChannelBinding.
@@ -41,10 +60,11 @@ export function createBinding(
   const defaultProviderId = store.getSetting('bridge_default_provider_id') || '';
 
   const displayName = address.displayName || address.chatId;
+  const systemPrompt = loadChannelPersona(address.channelType);
   const session = store.createSession(
     `Bridge: ${displayName}`,
     defaultModel,
-    undefined,
+    systemPrompt,
     defaultCwd,
     'code',
   );
