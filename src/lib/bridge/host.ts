@@ -128,6 +128,7 @@ export interface OutboundRefInput {
 /** Input for upserting a channel binding. */
 export interface UpsertChannelBindingInput {
   channelType: string;
+  botName?: string;
   chatId: string;
   codepilotSessionId: string;
   sdkSessionId?: string;
@@ -145,7 +146,7 @@ export interface BridgeStore {
   getSetting(key: string): string | null;
 
   // ── Channel bindings ──
-  getChannelBinding(channelType: string, chatId: string): ChannelBinding | null;
+  getChannelBinding(channelType: string, chatId: string, botName?: string): ChannelBinding | null;
   upsertChannelBinding(data: UpsertChannelBindingInput): ChannelBinding;
   updateChannelBinding(id: string, updates: Partial<ChannelBinding>): void;
   listChannelBindings(channelType?: ChannelType): ChannelBinding[];
@@ -215,6 +216,12 @@ export interface StreamChatParams {
   conversationHistory?: Array<{ role: 'user' | 'assistant'; content: string }>;
   files?: FileAttachment[];
   onRuntimeStatusChange?: (status: string) => void;
+  /** IM channel type (feishu | telegram | discord | ...) the message came from. */
+  senderChannel?: string;
+  /** Platform-specific user id of the sender (feishu open_id, telegram numeric id, etc). */
+  senderUserId?: string;
+  /** Optional display name of the sender, for logs and prompts. */
+  senderName?: string;
 }
 
 export interface LLMProvider {

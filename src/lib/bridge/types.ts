@@ -21,6 +21,7 @@ export type ChannelType = string;
 /** Unique address of a user within a channel */
 export interface ChannelAddress {
   channelType: ChannelType;
+  botName?: string;      // Logical bot instance name when multiple bots share a channel type
   chatId: string;        // Platform-specific chat/channel identifier
   userId?: string;       // Platform-specific user identifier (optional for group chats)
   displayName?: string;  // Human-readable name for audit logs
@@ -90,6 +91,7 @@ export interface SendResult {
 export interface ChannelBinding {
   id: string;
   channelType: ChannelType;
+  botName?: string;
   chatId: string;
   /** CodePilot session ID this chat is bound to */
   codepilotSessionId: string;
@@ -187,3 +189,16 @@ export const PLATFORM_LIMITS: Record<string, number> = {
   qq: 2000,
   weixin: 4000,
 };
+
+export interface FeishuBotConfig {
+  name: string;
+  appId: string;
+  appSecret: string;
+  domain?: 'feishu' | 'lark';
+  allowedUsers?: string[];
+  requireMention?: boolean;
+  groupPolicy?: 'open' | 'disabled' | 'allowlist';
+  groupAllowFrom?: string[];
+  workingDirectory?: string;
+  userOverrides?: Map<string, { workingDirectory?: string }>;
+}
