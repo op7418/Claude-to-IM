@@ -120,6 +120,7 @@ export interface BridgeStatus {
 
 /** Status of a single channel adapter */
 export interface AdapterStatus {
+  instanceKey: string;
   channelType: ChannelType;
   running: boolean;
   connectedAt: string | null;
@@ -199,6 +200,6 @@ export interface FeishuBotConfig {
   requireMention?: boolean;
   groupPolicy?: 'open' | 'disabled' | 'allowlist';
   groupAllowFrom?: string[];
-  workingDirectory?: string;
+  workingDirectory: string;
   userOverrides?: Map<string, { workingDirectory?: string }>;
 }

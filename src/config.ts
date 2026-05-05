@@ -139,7 +139,11 @@ export function parseFeishuBotConfigs(env: Map<string, string>): FeishuBotConfig
           : undefined,
         groupPolicy,
         groupAllowFrom: splitCsv(env.get(`${prefix}GROUP_ALLOW_FROM`)),
-        workingDirectory: env.get(`${prefix}WORKING_DIR`) || undefined,
+        workingDirectory: (() => {
+          const wd = env.get(`${prefix}WORKING_DIR`);
+          if (!wd) throw new Error(`${prefix}WORKING_DIR is required (each bot must have its own working directory)`);
+          return wd;
+        })(),
         userOverrides: userOverrides.size > 0 ? userOverrides : undefined,
       } satisfies FeishuBotConfig;
     });
