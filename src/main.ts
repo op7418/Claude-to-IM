@@ -137,6 +137,9 @@ async function main(): Promise<void> {
   );
 
   const settingsMap = configToSettings(config);
+  for (const [k, v] of Object.entries(process.env)) {
+    if (k.startsWith('CTI_FEISHU_BOTS_') && v) settingsMap.set(k, v);
+  }
   const feishuBotConfigs = parseFeishuBotConfigs(settingsMap);
   const globalStore = new JsonFileStore(settingsMap);
   const botStores = new Map<string, BridgeStore>();
