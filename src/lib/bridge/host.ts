@@ -222,6 +222,8 @@ export interface StreamChatParams {
   senderUserId?: string;
   /** Optional display name of the sender, for logs and prompts. */
   senderName?: string;
+  /** Bot instance name for per-bot env isolation (lark-cli config dir). */
+  botName?: string;
 }
 
 export interface LLMProvider {

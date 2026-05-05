@@ -15,6 +15,7 @@ import os from 'node:os';
 import path from 'node:path';
 
 import type { LLMProvider, StreamChatParams } from 'claude-to-im/src/lib/bridge/host.js';
+import { getBridgeContext } from './lib/bridge/context.js';
 import type { PendingPermissions } from './permission-gateway.js';
 import { sseEvent } from './sse-utils.js';
 
@@ -69,6 +70,24 @@ function shouldRetryFreshThread(message: string): boolean {
   );
 }
 
+function buildProcessEnvWithLarkCliConfigDir(larkCliConfigDir: string): Record<string, string> {
+  const env: Record<string, string> = {};
+  for (const [key, value] of Object.entries(process.env)) {
+    if (value !== undefined) env[key] = value;
+  }
+  env.LARKSUITE_CLI_CONFIG_DIR = larkCliConfigDir;
+  return env;
+}
+
+function getBotLarkCliEnv(params: StreamChatParams): Record<string, string> | undefined {
+  if (!params.botName) return undefined;
+  const ctx = getBridgeContext();
+  const botConfig = ctx.feishuBotConfigs?.find(b => b.name === params.botName);
+  return botConfig?.larkCliConfigDir
+    ? buildProcessEnvWithLarkCliConfigDir(botConfig.larkCliConfigDir)
+    : undefined;
+}
+
 export class CodexProvider implements LLMProvider {
   private sdk: CodexModule | null = null;
   private codex: CodexInstance | null = null;
@@ -111,6 +130,20 @@ export class CodexProvider implements LLMProvider {
     return { sdk: this.sdk, codex: this.codex };
   }
 
+  private createCodexWithEnv(sdk: CodexModule, env: Record<string, string>): CodexInstance {
+    const apiKey = process.env.CTI_CODEX_API_KEY
+      || process.env.CODEX_API_KEY
+      || process.env.OPENAI_API_KEY
+      || undefined;
+    const baseUrl = process.env.CTI_CODEX_BASE_URL || undefined;
+    const CodexClass = sdk.Codex;
+    return new CodexClass({
+      ...(apiKey ? { apiKey } : {}),
+      ...(baseUrl ? { baseUrl } : {}),
+      env,
+    });
+  }
+
   streamChat(params: StreamChatParams): ReadableStream<string> {
     const self = this;
 
@@ -119,7 +152,9 @@ export class CodexProvider implements LLMProvider {
         (async () => {
           const tempFiles: string[] = [];
           try {
-            const { codex } = await self.ensureSDK();
+            const { sdk, codex } = await self.ensureSDK();
+            const botEnv = getBotLarkCliEnv(params);
+            const activeCodex = botEnv ? self.createCodexWithEnv(sdk, botEnv) : codex;
 
             // Resolve or create thread
             const inMemoryThreadId = self.threadIds.get(params.sessionId);
@@ -182,12 +217,12 @@ export class CodexProvider implements LLMProvider {
               let thread: ThreadInstance;
               if (savedThreadId) {
                 try {
-                  thread = codex.resumeThread(savedThreadId, threadOptions);
+                  thread = activeCodex.resumeThread(savedThreadId, threadOptions);
                 } catch {
-                  thread = codex.startThread(threadOptions);
+                  thread = activeCodex.startThread(threadOptions);
                 }
               } else {
-                thread = codex.startThread(threadOptions);
+                thread = activeCodex.startThread(threadOptions);
               }
 
               let sawAnyEvent = false;

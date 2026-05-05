@@ -10,6 +10,7 @@ import { execSync } from 'node:child_process';
 import { query } from '@anthropic-ai/claude-agent-sdk';
 import type { SDKMessage, PermissionResult } from '@anthropic-ai/claude-agent-sdk';
 import type { LLMProvider, StreamChatParams, FileAttachment } from 'claude-to-im/src/lib/bridge/host.js';
+import { getBridgeContext } from './lib/bridge/context.js';
 import type { PendingPermissions } from './permission-gateway.js';
 
 import { sseEvent } from './sse-utils.js';
@@ -505,6 +506,15 @@ export class SDKLLMProvider implements LLMProvider {
               console.log(
                 `[llm-provider] Spawning CC with sender: channel=${params.senderChannel || '-'} user_id=${params.senderUserId || '-'} name=${params.senderName || '-'}`,
               );
+            }
+
+            // Per-bot lark-cli identity isolation.
+            if (params.botName) {
+              const ctx = getBridgeContext();
+              const botConfig = ctx.feishuBotConfigs?.find(b => b.name === params.botName);
+              if (botConfig?.larkCliConfigDir) {
+                cleanEnv.LARKSUITE_CLI_CONFIG_DIR = botConfig.larkCliConfigDir;
+              }
             }
 
             // Cross-runtime migration safety: drop non-Claude model names

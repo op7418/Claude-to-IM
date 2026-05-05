@@ -201,5 +201,6 @@ export interface FeishuBotConfig {
   groupPolicy?: 'open' | 'disabled' | 'allowlist';
   groupAllowFrom?: string[];
   workingDirectory: string;
+  larkCliConfigDir?: string;
   userOverrides?: Map<string, { workingDirectory?: string }>;
 }

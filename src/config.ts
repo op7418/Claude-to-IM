@@ -144,6 +144,7 @@ export function parseFeishuBotConfigs(env: Map<string, string>): FeishuBotConfig
           if (!wd) throw new Error(`${prefix}WORKING_DIR is required (each bot must have its own working directory)`);
           return wd;
         })(),
+        larkCliConfigDir: env.get(`${prefix}LARK_CLI_CONFIG_DIR`) || undefined,
         userOverrides: userOverrides.size > 0 ? userOverrides : undefined,
       } satisfies FeishuBotConfig;
     });

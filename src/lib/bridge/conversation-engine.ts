@@ -250,6 +250,7 @@ export async function processMessage(
       senderChannel: sender?.channel || binding.channelType,
       senderUserId: sender?.userId,
       senderName: sender?.displayName,
+      botName: binding.botName,
     });
 
     // Consume the stream server-side (replicate collectStreamResponse pattern).
