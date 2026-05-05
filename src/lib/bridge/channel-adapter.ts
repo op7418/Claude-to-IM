@@ -12,10 +12,16 @@ import type {
   PreviewCapabilities,
   SendResult,
 } from './types.js';
+import type { BridgeStore } from './host.js';
 
 export abstract class BaseChannelAdapter {
   /** Which channel type this adapter handles */
   abstract readonly channelType: ChannelType;
+
+  /** Unique adapter instance key. Defaults to the channel type for single-instance adapters. */
+  get instanceKey(): string {
+    return this.channelType;
+  }
 
   /**
    * Start the adapter (connect, begin polling/websocket, etc.).
@@ -131,15 +137,18 @@ export abstract class BaseChannelAdapter {
 
 // ── Adapter Registry ────────────────────────────────────────────
 
-const adapterFactories = new Map<string, () => BaseChannelAdapter>();
+export type AdapterFactory = (config?: unknown, store?: BridgeStore) => BaseChannelAdapter;
 
-export function registerAdapterFactory(channelType: string, factory: () => BaseChannelAdapter): void {
+const adapterFactories = new Map<string, AdapterFactory>();
+
+export function registerAdapterFactory(channelType: string, factory: AdapterFactory): void {
   adapterFactories.set(channelType, factory);
 }
 
-export function createAdapter(channelType: string): BaseChannelAdapter | null {
+export function createAdapter(channelType: ChannelType, config?: unknown, store?: BridgeStore): BaseChannelAdapter {
   const factory = adapterFactories.get(channelType);
-  return factory ? factory() : null;
+  if (!factory) throw new Error(`No adapter factory for ${channelType}`);
+  return factory(config, store);
 }
 
 export function getRegisteredTypes(): string[] {
