@@ -41,8 +41,8 @@
   },
   "dependencies": {
     "@anthropic-ai/claude-agent-sdk": "^0.2.62",
+    "@larksuiteoapi/node-sdk": "^1.60.0",
     "content-guard": "file:../../projects/content-guard",
-    "@larksuiteoapi/node-sdk": "^1.59.0",
     "discord.js": "^14.25.1",
     "markdown-it": "^14.1.1",
     "ws": "^8.18.0"
