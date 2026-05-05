@@ -358,9 +358,21 @@ const SUPPORTED_IMAGE_TYPES = new Set<string>([
  * iterable that yields a single SDKUserMessage with multi-modal content
  * (image blocks + text). Otherwise returns the plain text string.
  */
+interface SenderContext {
+  channel?: string;
+  userId?: string;
+  name?: string;
+}
+
+/** Escape double quotes so the XML attribute stays well-formed. */
+function xmlAttr(s: string): string {
+  return s.replace(/&/g, '&amp;').replace(/"/g, '&quot;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+}
+
 function buildPrompt(
   text: string,
   files?: FileAttachment[],
+  sender?: SenderContext,
 ): string | AsyncIterable<{ type: 'user'; message: { role: 'user'; content: unknown[] }; parent_tool_use_id: null; session_id: string }> {
   // Separate image files (multi-modal) from non-image files (path injection)
   const imageFiles = files?.filter(f => SUPPORTED_IMAGE_TYPES.has(f.type)) ?? [];
@@ -378,6 +390,18 @@ function buildPrompt(
       const prefix = `The user sent the following file(s). Read them with the Read tool to see their contents:\n${fileList}\n\n`;
       augmentedText = prefix + (text || 'Please read and analyze the attached file(s).');
     }
+  }
+
+  // Prepend a system-controlled sender header so CC knows exactly who is talking.
+  // User-typed `<cti-sender .../>` cannot spoof this because the header is emitted
+  // by the bridge, not the user, and CC is instructed to trust only the first tag.
+  if (sender?.userId || sender?.channel) {
+    const parts: string[] = [];
+    if (sender.channel) parts.push(`channel="${xmlAttr(sender.channel)}"`);
+    if (sender.userId) parts.push(`user_id="${xmlAttr(sender.userId)}"`);
+    if (sender.name) parts.push(`name="${xmlAttr(sender.name)}"`);
+    const header = `<cti-sender ${parts.join(' ')}/>\n\n`;
+    augmentedText = header + augmentedText;
   }
 
   if (imageFiles.length === 0) return augmentedText;
@@ -461,8 +485,27 @@ export class SDKLLMProvider implements LLMProvider {
           let stderrBuf = '';
           const state: StreamState = { hasReceivedResult: false, hasStreamedText: false, toolNames: new Map(), lastAssistantText: '' };
 
+          // Overall timeout: abort if CC subprocess exceeds time limit (default 10 min)
+          const CC_MAX_TIMEOUT_MS = parseInt(process.env.CTI_CC_MAX_TIMEOUT_MS || '', 10) || 600_000;
+          const overallTimer = setTimeout(() => {
+            console.warn(`[llm-provider] CC subprocess exceeded ${CC_MAX_TIMEOUT_MS / 1000}s total timeout, aborting`);
+            params.abortController?.abort();
+          }, CC_MAX_TIMEOUT_MS);
+
           try {
             const cleanEnv = buildSubprocessEnv();
+
+            // Inject IM sender identity so the spawned CC session can route
+            // per-user actions (e.g. picking the correct Obsidian vault).
+            // These override any same-named keys from the parent env.
+            if (params.senderChannel) cleanEnv.CTI_SENDER_CHANNEL = params.senderChannel;
+            if (params.senderUserId) cleanEnv.CTI_SENDER_USER_ID = params.senderUserId;
+            if (params.senderName) cleanEnv.CTI_SENDER_NAME = params.senderName;
+            if (params.senderUserId || params.senderChannel) {
+              console.log(
+                `[llm-provider] Spawning CC with sender: channel=${params.senderChannel || '-'} user_id=${params.senderUserId || '-'} name=${params.senderName || '-'}`,
+              );
+            }
 
             // Cross-runtime migration safety: drop non-Claude model names
             // that may linger in session data from a previous Codex runtime.
@@ -532,7 +575,11 @@ export class SDKLLMProvider implements LLMProvider {
               queryOptions.pathToClaudeCodeExecutable = cliPath;
             }
 
-            const prompt = buildPrompt(params.prompt, params.files);
+            const prompt = buildPrompt(params.prompt, params.files, {
+              channel: params.senderChannel,
+              userId: params.senderUserId,
+              name: params.senderName,
+            });
             const q = query({
               prompt: prompt as Parameters<typeof query>[0]['prompt'],
               options: queryOptions as Parameters<typeof query>[0]['options'],
@@ -542,8 +589,10 @@ export class SDKLLMProvider implements LLMProvider {
               handleMessage(msg, controller, state);
             }
 
+            clearTimeout(overallTimer);
             controller.close();
           } catch (err) {
+            clearTimeout(overallTimer);
             const message = err instanceof Error ? err.message : String(err);
             console.error('[llm-provider] SDK query error:', err instanceof Error ? err.stack || err.message : err);
             if (stderrBuf) {

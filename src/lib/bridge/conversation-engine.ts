@@ -10,6 +10,7 @@ import fs from 'fs';
 import path from 'path';
 import type { ChannelBinding } from './types.js';
 import type {
+  BridgeStore,
   FileAttachment,
   SSEEvent,
   TokenUsage,
@@ -31,7 +32,10 @@ export interface PermissionRequestInfo {
  * so we must forward the request to the IM *during* stream consumption,
  * not after it returns.
  */
-export type OnPermissionRequest = (perm: PermissionRequestInfo) => Promise<void>;
+export type OnPermissionRequest = (
+  perm: PermissionRequestInfo,
+  opts?: { store?: BridgeStore },
+) => Promise<void>;
 
 /**
  * Callback invoked on each `text` SSE event with the full accumulated text so far.
@@ -44,6 +48,17 @@ export type OnPartialText = (fullText: string) => void;
  * Used by bridge-manager to forward tool progress to adapters for real-time display.
  */
 export type OnToolEvent = (toolId: string, toolName: string, status: 'running' | 'complete' | 'error') => void;
+
+/**
+ * Identity of the IM user who sent the inbound message.
+ * Forwarded down to the LLM provider so CC spawns with per-user env vars
+ * (CTI_SENDER_CHANNEL / CTI_SENDER_USER_ID / CTI_SENDER_NAME).
+ */
+export interface SenderInfo {
+  channel?: string;
+  userId?: string;
+  displayName?: string;
+}
 
 // ── Outbound file detection ──────────────────────────────────
 
@@ -113,13 +128,17 @@ export async function processMessage(
   files?: FileAttachment[],
   onPartialText?: OnPartialText,
   onToolEvent?: OnToolEvent,
+  sender?: SenderInfo,
+  opts?: { store?: BridgeStore },
 ): Promise<ConversationResult> {
-  const { store, llm } = getBridgeContext();
+  const ctx = getBridgeContext();
+  const s = opts?.store || ctx.store;
+  const { llm } = ctx;
   const sessionId = binding.codepilotSessionId;
 
   // Acquire session lock
   const lockId = crypto.randomBytes(8).toString('hex');
-  const lockAcquired = store.acquireSessionLock(sessionId, lockId, `bridge-${binding.channelType}`, 600);
+  const lockAcquired = s.acquireSessionLock(sessionId, lockId, `bridge-${binding.channelType}`, 600);
   if (!lockAcquired) {
     return {
       responseText: '',
@@ -132,16 +151,16 @@ export async function processMessage(
     };
   }
 
-  store.setSessionRuntimeStatus(sessionId, 'running');
+  s.setSessionRuntimeStatus(sessionId, 'running');
 
   // Lock renewal interval
   const renewalInterval = setInterval(() => {
-    try { store.renewSessionLock(sessionId, lockId, 600); } catch { /* best effort */ }
+    try { s.renewSessionLock(sessionId, lockId, 600); } catch { /* best effort */ }
   }, 60_000);
 
   try {
     // Resolve session early — needed for workingDirectory and provider resolution
-    const session = store.getSession(sessionId);
+    const session = s.getSession(sessionId);
 
     // Save user message — persist file attachments to disk using the same
     // <!--files:JSON--> format as the desktop chat route, so the UI can render them.
@@ -173,21 +192,21 @@ export async function processMessage(
         savedContent = `[${files.length} image(s) attached] ${text}`;
       }
     }
-    store.addMessage(sessionId, 'user', savedContent);
+    s.addMessage(sessionId, 'user', savedContent);
 
     // Resolve provider
     let resolvedProvider: import('./host.js').BridgeApiProvider | undefined;
     const providerId = session?.provider_id || '';
     if (providerId && providerId !== 'env') {
-      resolvedProvider = store.getProvider(providerId);
+      resolvedProvider = s.getProvider(providerId);
     }
     if (!resolvedProvider) {
-      const defaultId = store.getDefaultProviderId();
-      if (defaultId) resolvedProvider = store.getProvider(defaultId);
+      const defaultId = s.getDefaultProviderId();
+      if (defaultId) resolvedProvider = s.getProvider(defaultId);
     }
 
     // Effective model
-    const effectiveModel = binding.model || session?.model || store.getSetting('default_model') || undefined;
+    const effectiveModel = binding.model || session?.model || s.getSetting('default_model') || undefined;
 
     // Permission mode from binding mode
     let permissionMode: string;
@@ -198,7 +217,7 @@ export async function processMessage(
     }
 
     // Load conversation history for context
-    const { messages: recentMsgs } = store.getMessages(sessionId, { limit: 50 });
+    const { messages: recentMsgs } = s.getMessages(sessionId, { limit: 50 });
     const historyMsgs = recentMsgs.slice(0, -1).map(m => ({
       role: m.role as 'user' | 'assistant',
       content: m.content,
@@ -226,18 +245,21 @@ export async function processMessage(
       conversationHistory: historyMsgs,
       files,
       onRuntimeStatusChange: (status: string) => {
-        try { store.setSessionRuntimeStatus(sessionId, status); } catch { /* best effort */ }
+        try { s.setSessionRuntimeStatus(sessionId, status); } catch { /* best effort */ }
       },
+      senderChannel: sender?.channel || binding.channelType,
+      senderUserId: sender?.userId,
+      senderName: sender?.displayName,
     });
 
     // Consume the stream server-side (replicate collectStreamResponse pattern).
     // Permission requests are forwarded immediately via the callback during streaming
     // because the stream blocks until permission is resolved — we can't wait until after.
-    return await consumeStream(stream, sessionId, onPermissionRequest, onPartialText, onToolEvent);
+    return await consumeStream(stream, sessionId, onPermissionRequest, onPartialText, onToolEvent, s);
   } finally {
     clearInterval(renewalInterval);
-    store.releaseSessionLock(sessionId, lockId);
-    store.setSessionRuntimeStatus(sessionId, 'idle');
+    s.releaseSessionLock(sessionId, lockId);
+    s.setSessionRuntimeStatus(sessionId, 'idle');
   }
 }
 
@@ -251,8 +273,9 @@ async function consumeStream(
   onPermissionRequest?: OnPermissionRequest,
   onPartialText?: OnPartialText,
   onToolEvent?: OnToolEvent,
+  store?: BridgeStore,
 ): Promise<ConversationResult> {
-  const { store } = getBridgeContext();
+  const s = store || getBridgeContext().store;
   const reader = stream.getReader();
   const contentBlocks: MessageContentBlock[] = [];
   let currentText = '';
@@ -266,9 +289,25 @@ async function consumeStream(
   const createdFiles: string[] = [];
   let capturedSdkSessionId: string | null = null;
 
+  // Idle timeout: abort if no stream data received within the limit (default 5 min).
+  // Covers stuck CC subprocesses, zombie processes, and hung tool calls.
+  const STREAM_IDLE_TIMEOUT_MS = parseInt(process.env.CTI_STREAM_IDLE_TIMEOUT_MS || '', 10) || 300_000;
+  function readWithIdleTimeout() {
+    let timer: ReturnType<typeof setTimeout>;
+    return Promise.race([
+      reader.read(),
+      new Promise<never>((_, reject) => {
+        timer = setTimeout(
+          () => reject(new Error(`Stream idle timeout: no data for ${STREAM_IDLE_TIMEOUT_MS / 1000}s`)),
+          STREAM_IDLE_TIMEOUT_MS,
+        );
+      }),
+    ]).finally(() => clearTimeout(timer!));
+  }
+
   try {
     while (true) {
-      const { done, value } = await reader.read();
+      const { done, value } = await readWithIdleTimeout();
       if (done) break;
 
       const lines = value.split('\n');
@@ -359,7 +398,7 @@ async function consumeStream(
               // Forward immediately — the stream blocks until the permission is
               // resolved, so we must send the IM prompt *now*, not after the stream ends.
               if (onPermissionRequest) {
-                onPermissionRequest(perm).catch((err) => {
+                onPermissionRequest(perm, { store: s }).catch((err) => {
                   console.error('[conversation-engine] Failed to forward permission request:', err);
                 });
               }
@@ -372,10 +411,10 @@ async function consumeStream(
               const statusData = JSON.parse(event.data);
               if (statusData.session_id) {
                 capturedSdkSessionId = statusData.session_id;
-                store.updateSdkSessionId(sessionId, statusData.session_id);
+                s.updateSdkSessionId(sessionId, statusData.session_id);
               }
               if (statusData.model) {
-                store.updateSessionModel(sessionId, statusData.model);
+                s.updateSessionModel(sessionId, statusData.model);
               }
             } catch { /* skip */ }
             break;
@@ -385,7 +424,7 @@ async function consumeStream(
             try {
               const taskData = JSON.parse(event.data);
               if (taskData.session_id && taskData.todos) {
-                store.syncSdkTasks(taskData.session_id, taskData.todos);
+                s.syncSdkTasks(taskData.session_id, taskData.todos);
               }
             } catch { /* skip */ }
             break;
@@ -403,7 +442,7 @@ async function consumeStream(
               if (resultData.is_error) hasError = true;
               if (resultData.session_id) {
                 capturedSdkSessionId = resultData.session_id;
-                store.updateSdkSessionId(sessionId, resultData.session_id);
+                s.updateSdkSessionId(sessionId, resultData.session_id);
               }
             } catch { /* skip */ }
             break;
@@ -433,7 +472,7 @@ async function consumeStream(
             .trim();
 
       if (content) {
-        store.addMessage(sessionId, 'assistant', content, tokenUsage ? JSON.stringify(tokenUsage) : null);
+        s.addMessage(sessionId, 'assistant', content, tokenUsage ? JSON.stringify(tokenUsage) : null);
       }
     }
 
@@ -470,7 +509,7 @@ async function consumeStream(
             .join('\n\n')
             .trim();
       if (content) {
-        store.addMessage(sessionId, 'assistant', content);
+        s.addMessage(sessionId, 'assistant', content);
       }
     }
 

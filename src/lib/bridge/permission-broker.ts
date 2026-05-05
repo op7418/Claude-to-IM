@@ -12,6 +12,7 @@
 import type { PermissionUpdate } from '@anthropic-ai/claude-agent-sdk';
 import type { ChannelAddress, OutboundMessage } from './types.js';
 import type { BaseChannelAdapter } from './channel-adapter.js';
+import type { BridgeStore } from './host.js';
 import { deliver } from './delivery-layer.js';
 import { getBridgeContext } from './context.js';
 import { escapeHtml } from './adapters/telegram-utils.js';
@@ -34,8 +35,9 @@ export async function forwardPermissionRequest(
   sessionId?: string,
   suggestions?: unknown[],
   replyToMessageId?: string,
+  store?: BridgeStore,
 ): Promise<void> {
-  const { store } = getBridgeContext();
+  const s = store || getBridgeContext().store;
 
   // Dedup: prevent duplicate forwarding of the same permission request
   const now = Date.now();
@@ -86,7 +88,7 @@ export async function forwardPermissionRequest(
       replyToMessageId,
     };
 
-    result = await deliver(adapter, plainMessage, { sessionId });
+    result = await deliver(adapter, plainMessage, { sessionId, store: s });
     console.log(
       `[permission-broker] Sent plain-text permission prompt for ${channelLabel}: ${permissionRequestId}`,
     );
@@ -114,13 +116,13 @@ export async function forwardPermissionRequest(
       replyToMessageId,
     };
 
-    result = await deliver(adapter, message, { sessionId });
+    result = await deliver(adapter, message, { sessionId, store: s });
   }
 
   // Record the link so we can match callback queries back to this permission
   if (result.ok && result.messageId) {
     try {
-      store.insertPermissionLink({
+      s.insertPermissionLink({
         permissionRequestId,
         channelType: adapter.channelType,
         chatId: address.chatId,
@@ -145,8 +147,11 @@ export function handlePermissionCallback(
   callbackData: string,
   callbackChatId: string,
   callbackMessageId?: string,
+  store?: BridgeStore,
 ): boolean {
-  const { store, permissions } = getBridgeContext();
+  const ctx = getBridgeContext();
+  const s = store || ctx.store;
+  const { permissions } = ctx;
 
   // Parse callback data: perm:action:permId
   const parts = callbackData.split(':');
@@ -156,7 +161,7 @@ export function handlePermissionCallback(
   const permissionRequestId = parts.slice(2).join(':'); // permId might contain colons
 
   // Look up the permission link to validate origin and check dedup
-  const link = store.getPermissionLink(permissionRequestId);
+  const link = s.getPermissionLink(permissionRequestId);
   if (!link) {
     console.warn(`[permission-broker] No permission link found for ${permissionRequestId}`);
     return false;
@@ -184,7 +189,7 @@ export function handlePermissionCallback(
   // to prevent race conditions with concurrent button clicks
   let claimed: boolean;
   try {
-    claimed = store.markPermissionLinkResolved(permissionRequestId);
+    claimed = s.markPermissionLinkResolved(permissionRequestId);
   } catch {
     return false;
   }
