@@ -22,9 +22,6 @@ import type {
 import type { ChannelBinding, ChannelType } from 'claude-to-im/src/lib/bridge/types.js';
 import { CTI_HOME } from './config.js';
 
-const DATA_DIR = path.join(CTI_HOME, 'data');
-const MESSAGES_DIR = path.join(DATA_DIR, 'messages');
-
 // ── Helpers ──
 
 function ensureDir(dir: string): void {
@@ -69,6 +66,8 @@ interface LockEntry {
 // ── Store ──
 
 export class JsonFileStore implements BridgeStore {
+  private dataDir: string;
+  private messagesDir: string;
   private settings: Map<string, string>;
   private sessions = new Map<string, BridgeSession>();
   private bindings = new Map<string, ChannelBinding>();
@@ -79,10 +78,13 @@ export class JsonFileStore implements BridgeStore {
   private locks = new Map<string, LockEntry>();
   private auditLog: Array<AuditLogInput & { id: string; createdAt: string }> = [];
 
-  constructor(settingsMap: Map<string, string>) {
+  constructor(settingsMap: Map<string, string>, dataDir?: string) {
     this.settings = settingsMap;
-    ensureDir(DATA_DIR);
-    ensureDir(MESSAGES_DIR);
+    const ctiHome = settingsMap.get('CTI_HOME') || CTI_HOME;
+    this.dataDir = dataDir || path.join(ctiHome, 'data');
+    this.messagesDir = path.join(this.dataDir, 'messages');
+    ensureDir(this.dataDir);
+    ensureDir(this.messagesDir);
     this.loadAll();
   }
 
@@ -91,7 +93,7 @@ export class JsonFileStore implements BridgeStore {
   private loadAll(): void {
     // Sessions
     const sessions = readJson<Record<string, BridgeSession>>(
-      path.join(DATA_DIR, 'sessions.json'),
+      path.join(this.dataDir, 'sessions.json'),
       {},
     );
     for (const [id, s] of Object.entries(sessions)) {
@@ -100,7 +102,7 @@ export class JsonFileStore implements BridgeStore {
 
     // Bindings
     const bindings = readJson<Record<string, ChannelBinding>>(
-      path.join(DATA_DIR, 'bindings.json'),
+      path.join(this.dataDir, 'bindings.json'),
       {},
     );
     for (const [key, b] of Object.entries(bindings)) {
@@ -109,7 +111,7 @@ export class JsonFileStore implements BridgeStore {
 
     // Permission links
     const perms = readJson<Record<string, PermissionLinkRecord>>(
-      path.join(DATA_DIR, 'permissions.json'),
+      path.join(this.dataDir, 'permissions.json'),
       {},
     );
     for (const [id, p] of Object.entries(perms)) {
@@ -118,7 +120,7 @@ export class JsonFileStore implements BridgeStore {
 
     // Offsets
     const offsets = readJson<Record<string, string>>(
-      path.join(DATA_DIR, 'offsets.json'),
+      path.join(this.dataDir, 'offsets.json'),
       {},
     );
     for (const [k, v] of Object.entries(offsets)) {
@@ -127,7 +129,7 @@ export class JsonFileStore implements BridgeStore {
 
     // Dedup
     const dedup = readJson<Record<string, number>>(
-      path.join(DATA_DIR, 'dedup.json'),
+      path.join(this.dataDir, 'dedup.json'),
       {},
     );
     for (const [k, v] of Object.entries(dedup)) {
@@ -135,51 +137,51 @@ export class JsonFileStore implements BridgeStore {
     }
 
     // Audit
-    this.auditLog = readJson(path.join(DATA_DIR, 'audit.json'), []);
+    this.auditLog = readJson(path.join(this.dataDir, 'audit.json'), []);
   }
 
   private persistSessions(): void {
     writeJson(
-      path.join(DATA_DIR, 'sessions.json'),
+      path.join(this.dataDir, 'sessions.json'),
       Object.fromEntries(this.sessions),
     );
   }
 
   private persistBindings(): void {
     writeJson(
-      path.join(DATA_DIR, 'bindings.json'),
+      path.join(this.dataDir, 'bindings.json'),
       Object.fromEntries(this.bindings),
     );
   }
 
   private persistPermissions(): void {
     writeJson(
-      path.join(DATA_DIR, 'permissions.json'),
+      path.join(this.dataDir, 'permissions.json'),
       Object.fromEntries(this.permissionLinks),
     );
   }
 
   private persistOffsets(): void {
     writeJson(
-      path.join(DATA_DIR, 'offsets.json'),
+      path.join(this.dataDir, 'offsets.json'),
       Object.fromEntries(this.offsets),
     );
   }
 
   private persistDedup(): void {
     writeJson(
-      path.join(DATA_DIR, 'dedup.json'),
+      path.join(this.dataDir, 'dedup.json'),
       Object.fromEntries(this.dedupKeys),
     );
   }
 
   private persistAudit(): void {
-    writeJson(path.join(DATA_DIR, 'audit.json'), this.auditLog);
+    writeJson(path.join(this.dataDir, 'audit.json'), this.auditLog);
   }
 
   private persistMessages(sessionId: string): void {
     const msgs = this.messages.get(sessionId) || [];
-    writeJson(path.join(MESSAGES_DIR, `${sessionId}.json`), msgs);
+    writeJson(path.join(this.messagesDir, `${sessionId}.json`), msgs);
   }
 
   private loadMessages(sessionId: string): BridgeMessage[] {
@@ -187,7 +189,7 @@ export class JsonFileStore implements BridgeStore {
       return this.messages.get(sessionId)!;
     }
     const msgs = readJson<BridgeMessage[]>(
-      path.join(MESSAGES_DIR, `${sessionId}.json`),
+      path.join(this.messagesDir, `${sessionId}.json`),
       [],
     );
     this.messages.set(sessionId, msgs);
@@ -202,16 +204,20 @@ export class JsonFileStore implements BridgeStore {
 
   // ── Channel Bindings ──
 
-  getChannelBinding(channelType: string, chatId: string): ChannelBinding | null {
-    return this.bindings.get(`${channelType}:${chatId}`) ?? null;
+  getChannelBinding(channelType: ChannelType, chatId: string, botName?: string): ChannelBinding | null {
+    const key = botName ? `${channelType}:${botName}:${chatId}` : `${channelType}:${chatId}`;
+    return this.bindings.get(key) ?? null;
   }
 
   upsertChannelBinding(data: UpsertChannelBindingInput): ChannelBinding {
-    const key = `${data.channelType}:${data.chatId}`;
+    const key = data.botName
+      ? `${data.channelType}:${data.botName}:${data.chatId}`
+      : `${data.channelType}:${data.chatId}`;
     const existing = this.bindings.get(key);
     if (existing) {
       const updated: ChannelBinding = {
         ...existing,
+        botName: data.botName,
         codepilotSessionId: data.codepilotSessionId,
         workingDirectory: data.workingDirectory,
         model: data.model,
@@ -224,6 +230,7 @@ export class JsonFileStore implements BridgeStore {
     const binding: ChannelBinding = {
       id: uuid(),
       channelType: data.channelType,
+      botName: data.botName,
       chatId: data.chatId,
       codepilotSessionId: data.codepilotSessionId,
       sdkSessionId: '',
