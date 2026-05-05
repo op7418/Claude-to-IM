@@ -1,6 +1,7 @@
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
+import type { FeishuBotConfig } from "./lib/bridge/types";
 
 export interface Config {
   runtime: 'claude' | 'codex' | 'auto';
@@ -78,6 +79,69 @@ function splitCsv(value: string | undefined): string[] | undefined {
     .split(",")
     .map((s) => s.trim())
     .filter(Boolean);
+}
+
+export function parseFeishuBotConfigs(env: Map<string, string>): FeishuBotConfig[] {
+  const hasLegacy = env.has("CTI_FEISHU_APP_ID") || env.has("CTI_FEISHU_APP_SECRET");
+  const hasBot0Name = env.has("CTI_FEISHU_BOTS_0_NAME");
+
+  if (hasLegacy && !hasBot0Name) {
+    throw new Error(
+      "Legacy single-bot config detected (CTI_FEISHU_APP_ID). " +
+        "Run migrate-to-multi-bot.sh to convert to the new multi-bot format (CTI_FEISHU_BOTS_N_*)."
+    );
+  }
+
+  const indices = new Set<number>();
+  for (const key of env.keys()) {
+    const match = key.match(/^CTI_FEISHU_BOTS_(\d+)_/);
+    if (match) indices.add(Number.parseInt(match[1], 10));
+  }
+
+  if (indices.size === 0) return [];
+
+  return Array.from(indices)
+    .sort((a, b) => a - b)
+    .map((index) => {
+      const prefix = `CTI_FEISHU_BOTS_${index}_`;
+      const name = env.get(`${prefix}NAME`);
+      if (!name) throw new Error(`${prefix}NAME is required`);
+
+      const appId = env.get(`${prefix}APP_ID`);
+      if (!appId) throw new Error(`${prefix}APP_ID is required`);
+
+      const appSecret = env.get(`${prefix}APP_SECRET`);
+      if (!appSecret) throw new Error(`${prefix}APP_SECRET is required`);
+
+      const domain = env.get(`${prefix}DOMAIN`) as FeishuBotConfig["domain"];
+      const groupPolicy = env.get(`${prefix}GROUP_POLICY`) as FeishuBotConfig["groupPolicy"];
+      const userOverrides = new Map<string, { workingDirectory?: string }>();
+      const userOverridePattern = new RegExp(
+        `^${prefix.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}USER_(.+)_WORKING_DIR$`
+      );
+
+      for (const [key, value] of env) {
+        const match = key.match(userOverridePattern);
+        if (match) {
+          userOverrides.set(match[1], { workingDirectory: value });
+        }
+      }
+
+      return {
+        name,
+        appId,
+        appSecret,
+        domain,
+        allowedUsers: splitCsv(env.get(`${prefix}ALLOWED_USERS`)),
+        requireMention: env.has(`${prefix}REQUIRE_MENTION`)
+          ? env.get(`${prefix}REQUIRE_MENTION`) === "true"
+          : undefined,
+        groupPolicy,
+        groupAllowFrom: splitCsv(env.get(`${prefix}GROUP_ALLOW_FROM`)),
+        workingDirectory: env.get(`${prefix}WORKING_DIR`) || undefined,
+        userOverrides: userOverrides.size > 0 ? userOverrides : undefined,
+      } satisfies FeishuBotConfig;
+    });
 }
 
 export function loadConfig(): Config {
