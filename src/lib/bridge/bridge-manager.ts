@@ -10,6 +10,7 @@
 import type { BridgeStatus, InboundMessage, OutboundMessage, StreamingPreviewState, ToolCallInfo } from './types.js';
 import { createAdapter, getRegisteredTypes } from './channel-adapter.js';
 import type { BaseChannelAdapter } from './channel-adapter.js';
+import type { BridgeStore } from './host.js';
 // Side-effect import: triggers self-registration of all adapter factories
 import './adapters/index.js';
 import * as router from './channel-router.js';
@@ -134,8 +135,11 @@ const STREAM_DEFAULTS: Record<string, StreamConfig> = {
   discord: { intervalMs: 1500, minDeltaChars: 40, maxChars: 1900 },
 };
 
-function getStreamConfig(channelType = 'telegram'): StreamConfig {
-  const { store } = getBridgeContext();
+function getAdapterStore(adapter: BaseChannelAdapter): BridgeStore {
+  return (adapter as BaseChannelAdapter & { botStore?: BridgeStore }).botStore || getBridgeContext().store;
+}
+
+function getStreamConfig(channelType = 'telegram', store = getBridgeContext().store): StreamConfig {
   const defaults = STREAM_DEFAULTS[channelType] || STREAM_DEFAULTS.telegram;
   const prefix = `bridge_${channelType}_stream_`;
   const intervalMs = parseInt(store.getSetting(`${prefix}interval_ms`) || '', 10) || defaults.intervalMs;
@@ -153,11 +157,15 @@ function getStreamConfig(channelType = 'telegram'): StreamConfig {
  * waiting for the permission to be resolved, so putting "1" behind the
  * session lock would deadlock.
  */
-function isNumericPermissionShortcut(channelType: string, rawText: string, chatId: string): boolean {
+function isNumericPermissionShortcut(
+  channelType: string,
+  rawText: string,
+  chatId: string,
+  store: BridgeStore,
+): boolean {
   if (channelType !== 'feishu' && channelType !== 'qq' && channelType !== 'weixin') return false;
   const normalized = rawText.normalize('NFKC').replace(/[\u200B-\u200D\uFEFF]/g, '').trim();
   if (!/^[123]$/.test(normalized)) return false;
-  const { store } = getBridgeContext();
   const pending = store.listPendingPermissionLinksByChat(chatId);
   return pending.length > 0; // any pending → route to inline path
 }
@@ -200,11 +208,12 @@ async function deliverResponse(
   responseText: string,
   sessionId: string,
   replyToMessageId?: string,
+  store?: BridgeStore,
 ): Promise<SendResult> {
   if (adapter.channelType === 'telegram') {
     const chunks = markdownToTelegramChunks(responseText, 4096);
     if (chunks.length > 0) {
-      return deliverRendered(adapter, address, chunks, { sessionId, replyToMessageId });
+      return deliverRendered(adapter, address, chunks, { sessionId, replyToMessageId, store });
     }
     return { ok: true };
   }
@@ -217,7 +226,7 @@ async function deliverResponse(
         text: chunks[i].text,
         parseMode: 'Markdown',
         replyToMessageId,
-      }, { sessionId });
+      }, { sessionId, store });
       if (!result.ok) return result;
     }
     return { ok: true };
@@ -229,7 +238,7 @@ async function deliverResponse(
       text: responseText,
       parseMode: 'Markdown',
       replyToMessageId,
-    }, { sessionId });
+    }, { sessionId, store });
   }
   // Generic fallback: deliver as plain text (deliver() handles chunking internally)
   return deliver(adapter, {
@@ -237,7 +246,7 @@ async function deliverResponse(
     text: responseText,
     parseMode: 'plain',
     replyToMessageId,
-  }, { sessionId });
+  }, { sessionId, store });
 }
 
 interface AdapterMeta {
@@ -282,10 +291,31 @@ function getState(): BridgeManagerState {
  * Process a function with per-session serialization.
  * Different sessions run concurrently; same-session requests are serialized.
  */
+// Session lock timeout: release the lock if a single message takes too long,
+// so subsequent messages aren't blocked. Should exceed CC_MAX_TIMEOUT (10 min)
+// to let the CC-level abort fire first. Default 12 min.
+const SESSION_LOCK_TIMEOUT_MS = parseInt(process.env.CTI_SESSION_LOCK_TIMEOUT_MS || '', 10) || 720_000;
+
 function processWithSessionLock(sessionId: string, fn: () => Promise<void>): Promise<void> {
   const state = getState();
   const prev = state.sessionLocks.get(sessionId) || Promise.resolve();
-  const current = prev.then(fn, fn);
+
+  const timedFn = (): Promise<void> => {
+    const work = fn();
+    let timer: ReturnType<typeof setTimeout>;
+    const timeout = new Promise<void>((resolve) => {
+      timer = setTimeout(() => {
+        console.warn(
+          `[bridge-manager] Session lock timeout for ${sessionId.slice(0, 8)}: ` +
+          `releasing after ${SESSION_LOCK_TIMEOUT_MS / 1000}s`,
+        );
+        resolve();
+      }, SESSION_LOCK_TIMEOUT_MS);
+    });
+    return Promise.race([work, timeout]).finally(() => clearTimeout(timer!));
+  };
+
+  const current = prev.then(timedFn, timedFn);
   state.sessionLocks.set(sessionId, current);
   // Cleanup when the chain completes.
   // Suppress rejection on the cleanup chain — callers handle errors on `current` directly.
@@ -301,11 +331,12 @@ function processWithSessionLock(sessionId: string, fn: () => Promise<void>): Pro
  * Start the bridge system.
  * Checks feature flags, registers enabled adapters, starts polling loops.
  */
-export async function start(): Promise<void> {
+export async function start(opts?: { botStores?: Map<string, BridgeStore> }): Promise<void> {
   const state = getState();
   if (state.running) return;
 
-  const { store, lifecycle } = getBridgeContext();
+  const { store, lifecycle, feishuBotConfigs = [], botStores } = getBridgeContext();
+  const effectiveBotStores = opts?.botStores || botStores;
 
   const bridgeEnabled = store.getSetting('remote_bridge_enabled') === 'true';
   if (!bridgeEnabled) {
@@ -318,6 +349,22 @@ export async function start(): Promise<void> {
     const settingKey = `bridge_${channelType}_enabled`;
     if (store.getSetting(settingKey) !== 'true') continue;
 
+    if (channelType === 'feishu') {
+      for (const botConfig of feishuBotConfigs) {
+        const botStore = effectiveBotStores?.get(botConfig.name);
+        if (!botStore) throw new Error(`No store for feishu bot: ${botConfig.name}`);
+
+        const adapter = createAdapter('feishu', botConfig, botStore);
+        const configError = adapter.validateConfig();
+        if (!configError) {
+          registerAdapter(adapter);
+        } else {
+          console.warn(`[bridge-manager] ${adapter.instanceKey} adapter not valid:`, configError);
+        }
+      }
+      continue;
+    }
+
     const adapter = createAdapter(channelType);
     if (!adapter) continue;
 
@@ -325,7 +372,7 @@ export async function start(): Promise<void> {
     if (!configError) {
       registerAdapter(adapter);
     } else {
-      console.warn(`[bridge-manager] ${channelType} adapter not valid:`, configError);
+      console.warn(`[bridge-manager] ${adapter.instanceKey} adapter not valid:`, configError);
     }
   }
 
@@ -432,9 +479,10 @@ export function getStatus(): BridgeStatus {
   return {
     running: state.running,
     startedAt: state.startedAt,
-    adapters: Array.from(state.adapters.entries()).map(([type, adapter]) => {
-      const meta = state.adapterMeta.get(type);
+    adapters: Array.from(state.adapters.entries()).map(([instanceKey, adapter]) => {
+      const meta = state.adapterMeta.get(instanceKey);
       return {
+        instanceKey,
         channelType: adapter.channelType,
         running: adapter.isRunning(),
         connectedAt: state.startedAt,
@@ -450,7 +498,25 @@ export function getStatus(): BridgeStatus {
  */
 export function registerAdapter(adapter: BaseChannelAdapter): void {
   const state = getState();
-  state.adapters.set(adapter.channelType, adapter);
+  state.adapters.set(adapter.instanceKey, adapter);
+}
+
+/**
+ * Look up a registered adapter by instance key.
+ */
+export function getAdapter(instanceKey: string): BaseChannelAdapter | undefined {
+  return getState().adapters.get(instanceKey);
+}
+
+/**
+ * Unregister a channel adapter by instance key.
+ */
+export function unregisterAdapter(instanceKey: string): void {
+  const state = getState();
+  state.adapters.delete(instanceKey);
+  state.adapterMeta.delete(instanceKey);
+  state.loopAborts.get(instanceKey)?.abort();
+  state.loopAborts.delete(instanceKey);
 }
 
 /**
@@ -460,8 +526,10 @@ export function registerAdapter(adapter: BaseChannelAdapter): void {
  */
 function runAdapterLoop(adapter: BaseChannelAdapter): void {
   const state = getState();
+  const instanceKey = adapter.instanceKey;
+  const store = getAdapterStore(adapter);
   const abort = new AbortController();
-  state.loopAborts.set(adapter.channelType, abort);
+  state.loopAborts.set(instanceKey, abort);
 
   (async () => {
     while (state.running && adapter.isRunning()) {
@@ -480,11 +548,11 @@ function runAdapterLoop(adapter: BaseChannelAdapter): void {
         if (
           msg.callbackData ||
           msg.text.trim().startsWith('/') ||
-          isNumericPermissionShortcut(adapter.channelType, msg.text.trim(), msg.address.chatId)
+          isNumericPermissionShortcut(adapter.channelType, msg.text.trim(), msg.address.chatId, store)
         ) {
           await handleMessage(adapter, msg);
         } else {
-          const binding = router.resolve(msg.address);
+          const binding = router.resolve(msg.address, { store });
           // Fire-and-forget into session lock — loop continues to accept
           // messages for other sessions immediately.
           processWithSessionLock(binding.codepilotSessionId, () =>
@@ -496,11 +564,11 @@ function runAdapterLoop(adapter: BaseChannelAdapter): void {
       } catch (err) {
         if (abort.signal.aborted) break;
         const errMsg = err instanceof Error ? err.message : String(err);
-        console.error(`[bridge-manager] Error in ${adapter.channelType} loop:`, err);
+        console.error(`[bridge-manager] Error in ${instanceKey} loop:`, err);
         // Track last error per adapter
-        const meta = state.adapterMeta.get(adapter.channelType) || { lastMessageAt: null, lastError: null };
+        const meta = state.adapterMeta.get(instanceKey) || { lastMessageAt: null, lastError: null };
         meta.lastError = errMsg;
-        state.adapterMeta.set(adapter.channelType, meta);
+        state.adapterMeta.set(instanceKey, meta);
         // Brief delay to prevent tight error loops
         await new Promise(r => setTimeout(r, 1000));
       }
@@ -508,10 +576,10 @@ function runAdapterLoop(adapter: BaseChannelAdapter): void {
   })().catch(err => {
     if (!abort.signal.aborted) {
       const errMsg = err instanceof Error ? err.message : String(err);
-      console.error(`[bridge-manager] ${adapter.channelType} loop crashed:`, err);
-      const meta = state.adapterMeta.get(adapter.channelType) || { lastMessageAt: null, lastError: null };
+      console.error(`[bridge-manager] ${instanceKey} loop crashed:`, err);
+      const meta = state.adapterMeta.get(instanceKey) || { lastMessageAt: null, lastError: null };
       meta.lastError = errMsg;
-      state.adapterMeta.set(adapter.channelType, meta);
+      state.adapterMeta.set(instanceKey, meta);
     }
   });
 }
@@ -523,13 +591,14 @@ async function handleMessage(
   adapter: BaseChannelAdapter,
   msg: InboundMessage,
 ): Promise<void> {
-  const { store } = getBridgeContext();
+  const store = getAdapterStore(adapter);
+  const instanceKey = adapter.instanceKey;
 
   // Update lastMessageAt for this adapter
   const adapterState = getState();
-  const meta = adapterState.adapterMeta.get(adapter.channelType) || { lastMessageAt: null, lastError: null };
+  const meta = adapterState.adapterMeta.get(instanceKey) || { lastMessageAt: null, lastError: null };
   meta.lastMessageAt = new Date().toISOString();
-  adapterState.adapterMeta.set(adapter.channelType, meta);
+  adapterState.adapterMeta.set(instanceKey, meta);
 
   // Acknowledge the update offset after processing completes (or fails).
   // This ensures the adapter only advances its committed offset once the
@@ -542,7 +611,7 @@ async function handleMessage(
 
   // Handle callback queries (permission buttons)
   if (msg.callbackData) {
-    const handled = broker.handlePermissionCallback(msg.callbackData, msg.address.chatId, msg.callbackMessageId);
+    const handled = broker.handlePermissionCallback(msg.callbackData, msg.address.chatId, msg.callbackMessageId, store);
     if (handled) {
       // Send confirmation
       const confirmMsg: OutboundMessage = {
@@ -550,7 +619,7 @@ async function handleMessage(
         text: 'Permission response recorded.',
         parseMode: 'plain',
       };
-      await deliver(adapter, confirmMsg);
+      await deliver(adapter, confirmMsg, { store });
     }
     ack();
     return;
@@ -574,7 +643,7 @@ async function handleMessage(
         text: rawData.userVisibleError,
         parseMode: 'plain',
         replyToMessageId: msg.messageId,
-      });
+      }, { store });
     } else if (rawData?.imageDownloadFailed || rawData?.attachmentDownloadFailed) {
       const failureLabel = rawData.failedLabel || (rawData.imageDownloadFailed ? 'image(s)' : 'attachment(s)');
       await deliver(adapter, {
@@ -582,7 +651,7 @@ async function handleMessage(
         text: `Failed to download ${rawData.failedCount ?? 1} ${failureLabel}. Please try sending again.`,
         parseMode: 'plain',
         replyToMessageId: msg.messageId,
-      });
+      }, { store });
     }
     ack();
     return;
@@ -610,7 +679,7 @@ async function handleMessage(
         const action = actionMap[normalized];
         const permId = pendingLinks[0].permissionRequestId;
         const callbackData = `perm:${action}:${permId}`;
-        const handled = broker.handlePermissionCallback(callbackData, msg.address.chatId);
+        const handled = broker.handlePermissionCallback(callbackData, msg.address.chatId, undefined, store);
         const label = normalized === '1' ? 'Allow' : normalized === '2' ? 'Allow Session' : 'Deny';
         if (handled) {
           await deliver(adapter, {
@@ -618,14 +687,14 @@ async function handleMessage(
             text: `${label}: recorded.`,
             parseMode: 'plain',
             replyToMessageId: msg.messageId,
-          });
+          }, { store });
         } else {
           await deliver(adapter, {
             address: msg.address,
             text: `Permission not found or already resolved.`,
             parseMode: 'plain',
             replyToMessageId: msg.messageId,
-          });
+          }, { store });
         }
         ack();
         return;
@@ -637,7 +706,7 @@ async function handleMessage(
           text: `Multiple pending permissions (${pendingLinks.length}). Please use the full command:\n/perm allow|allow_session|deny <id>`,
           parseMode: 'plain',
           replyToMessageId: msg.messageId,
-        });
+        }, { store });
         ack();
         return;
       }
@@ -672,7 +741,7 @@ async function handleMessage(
   if (!text && !hasAttachments) { ack(); return; }
 
   // Regular message — route to conversation engine
-  const binding = router.resolve(msg.address);
+  const binding = router.resolve(msg.address, { store });
 
   // Notify adapter that message processing is starting (e.g., typing indicator)
   adapter.onMessageStart?.(msg.address.chatId);
@@ -697,7 +766,7 @@ async function handleMessage(
     };
   }
 
-  const streamCfg = previewState ? getStreamConfig(adapter.channelType) : null;
+  const streamCfg = previewState ? getStreamConfig(adapter.channelType, store) : null;
 
   // Build the preview onPartialText callback (or undefined if preview not supported)
   const previewOnPartialText = (previewState && streamCfg) ? (fullText: string) => {
@@ -780,7 +849,7 @@ async function handleMessage(
     // Use text or empty string for image-only messages (prompt is still required by streamClaude)
     const promptText = text || (hasAttachments ? 'Describe this image.' : '');
 
-    const result = await engine.processMessage(binding, promptText, async (perm) => {
+    const result = await engine.processMessage(binding, promptText, async (perm, permissionOpts) => {
       await broker.forwardPermissionRequest(
         adapter,
         msg.address,
@@ -790,8 +859,13 @@ async function handleMessage(
         binding.codepilotSessionId,
         perm.suggestions,
         msg.messageId,
+        permissionOpts?.store || store,
       );
-    }, taskAbort.signal, hasAttachments ? msg.attachments : undefined, onPartialText, onToolEvent);
+    }, taskAbort.signal, hasAttachments ? msg.attachments : undefined, onPartialText, onToolEvent, {
+      channel: msg.address.channelType,
+      userId: msg.address.userId,
+      displayName: msg.address.displayName,
+    }, { store });
 
     // Finalize streaming card if adapter supports it.
     // onStreamEnd awaits any in-flight card creation and returns true if a card
@@ -810,7 +884,7 @@ async function handleMessage(
     // Skip if streaming card was finalized (content already in card).
     if (result.responseText) {
       if (!cardFinalized) {
-        await deliverResponse(adapter, msg.address, result.responseText, binding.codepilotSessionId, msg.messageId);
+        await deliverResponse(adapter, msg.address, result.responseText, binding.codepilotSessionId, msg.messageId, store);
       }
     } else if (result.hasError) {
       const errorResponse: OutboundMessage = {
@@ -819,7 +893,7 @@ async function handleMessage(
         parseMode: 'HTML',
         replyToMessageId: msg.messageId,
       };
-      await deliver(adapter, errorResponse);
+      await deliver(adapter, errorResponse, { sessionId: binding.codepilotSessionId, store });
     }
 
     // ── Outbound file sending ──────────────────────────────────
@@ -895,7 +969,7 @@ async function handleCommand(
   msg: InboundMessage,
   text: string,
 ): Promise<void> {
-  const { store } = getBridgeContext();
+  const store = getAdapterStore(adapter);
 
   // Extract command and args (handle /command@botname format)
   const parts = text.split(/\s+/);
@@ -918,7 +992,7 @@ async function handleCommand(
       text: `Command rejected: invalid input detected.`,
       parseMode: 'plain',
       replyToMessageId: msg.messageId,
-    });
+    }, { store });
     return;
   }
 
@@ -946,7 +1020,7 @@ async function handleCommand(
 
     case '/new': {
       // Abort any running task on the current session before creating a new one
-      const oldBinding = router.resolve(msg.address);
+      const oldBinding = router.resolve(msg.address, { store });
       const st = getState();
       const oldTask = st.activeTasks.get(oldBinding.codepilotSessionId);
       if (oldTask) {
@@ -963,7 +1037,7 @@ async function handleCommand(
         }
         workDir = validated;
       }
-      const binding = router.createBinding(msg.address, workDir);
+      const binding = router.createBinding(msg.address, { store, workingDirectory: workDir });
       response = `New session created.\nSession: <code>${binding.codepilotSessionId.slice(0, 8)}...</code>\nCWD: <code>${escapeHtml(binding.workingDirectory || '~')}</code>`;
       break;
     }
@@ -977,7 +1051,7 @@ async function handleCommand(
         response = 'Invalid session ID format. Expected a 32-64 character hex/UUID string.';
         break;
       }
-      const binding = router.bindToSession(msg.address, args);
+      const binding = router.bindToSession(msg.address, args, { store });
       if (binding) {
         response = `Bound to session <code>${args.slice(0, 8)}...</code>`;
       } else {
@@ -996,8 +1070,8 @@ async function handleCommand(
         response = 'Invalid path. Must be an absolute path without traversal sequences or special characters.';
         break;
       }
-      const binding = router.resolve(msg.address);
-      router.updateBinding(binding.id, { workingDirectory: validatedPath });
+      const binding = router.resolve(msg.address, { store });
+      router.updateBinding(binding.id, { workingDirectory: validatedPath }, { store });
       response = `Working directory set to <code>${escapeHtml(validatedPath)}</code>`;
       break;
     }
@@ -1007,14 +1081,14 @@ async function handleCommand(
         response = 'Usage: /mode plan|code|ask';
         break;
       }
-      const binding = router.resolve(msg.address);
-      router.updateBinding(binding.id, { mode: args });
+      const binding = router.resolve(msg.address, { store });
+      router.updateBinding(binding.id, { mode: args }, { store });
       response = `Mode set to <b>${args}</b>`;
       break;
     }
 
     case '/status': {
-      const binding = router.resolve(msg.address);
+      const binding = router.resolve(msg.address, { store });
       response = [
         '<b>Bridge Status</b>',
         '',
@@ -1027,11 +1101,11 @@ async function handleCommand(
     }
 
     case '/sessions': {
-      const bindings = router.listBindings(adapter.channelType);
+      const bindings = router.listBindings(adapter.channelType, { store });
       if (bindings.length === 0) {
         response = 'No sessions found.';
       } else {
-        const currentBinding = router.resolve(msg.address);
+        const currentBinding = router.resolve(msg.address, { store });
         // Sort by most recently active first
         const sorted = bindings.slice().sort((a, b) => {
           const ta = a.updatedAt || a.createdAt || '';
@@ -1055,7 +1129,7 @@ async function handleCommand(
     }
 
     case '/stop': {
-      const binding = router.resolve(msg.address);
+      const binding = router.resolve(msg.address, { store });
       const st = getState();
       const taskAbort = st.activeTasks.get(binding.codepilotSessionId);
       if (taskAbort) {
@@ -1079,7 +1153,7 @@ async function handleCommand(
         break;
       }
       const callbackData = `perm:${permAction}:${permId}`;
-      const handled = broker.handlePermissionCallback(callbackData, msg.address.chatId);
+      const handled = broker.handlePermissionCallback(callbackData, msg.address.chatId, undefined, store);
       if (handled) {
         response = `Permission ${permAction}: recorded.`;
       } else {
@@ -1115,7 +1189,7 @@ async function handleCommand(
       text: response,
       parseMode: 'HTML',
       replyToMessageId: msg.messageId,
-    });
+    }, { store });
   }
 }
 

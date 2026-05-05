@@ -11,7 +11,9 @@
 import { describe, it, beforeEach } from 'node:test';
 import assert from 'node:assert/strict';
 import { initBridgeContext } from '../../lib/bridge/context';
+import type { BaseChannelAdapter } from '../../lib/bridge/channel-adapter';
 import type { BridgeStore, LifecycleHooks } from '../../lib/bridge/host';
+import type { InboundMessage, OutboundMessage, SendResult } from '../../lib/bridge/types';
 
 // ── Test the session lock mechanism directly ────────────────
 // We test the processWithSessionLock pattern by extracting its logic.
@@ -131,6 +133,73 @@ describe('bridge-manager lifecycle', () => {
     assert.equal(status.running, false);
     assert.equal(status.adapters.length, 0);
   });
+
+  it('registers and looks up adapters by instanceKey', async () => {
+    const store = createMinimalStore({ remote_bridge_enabled: 'false' });
+    initBridgeContext({
+      store,
+      llm: { streamChat: () => new ReadableStream() },
+      permissions: { resolvePendingPermission: () => false },
+      lifecycle: {},
+    });
+
+    const { registerAdapter, getAdapter, getStatus } = await import('../../lib/bridge/bridge-manager');
+    const adapter = createMockAdapter({ channelType: 'feishu', instanceKey: 'feishu:ccbot' });
+
+    registerAdapter(adapter);
+
+    assert.equal(getAdapter('feishu:ccbot'), adapter);
+    assert.equal(getAdapter('feishu'), undefined);
+    assert.equal(getStatus().adapters[0].instanceKey, 'feishu:ccbot');
+  });
+
+  it('derives the store from adapter.botStore for commands and permission callbacks', async () => {
+    const globalStore = createTrackingStore('global');
+    const botStore = createTrackingStore('ccbot');
+    initBridgeContext({
+      store: globalStore as unknown as BridgeStore,
+      llm: { streamChat: () => new ReadableStream() },
+      permissions: { resolvePendingPermission: () => true },
+      lifecycle: {},
+    });
+
+    const { _testOnly } = await import('../../lib/bridge/bridge-manager');
+    const adapter = createMockAdapter({
+      channelType: 'feishu',
+      instanceKey: 'feishu:ccbot',
+      botStore: botStore as unknown as BridgeStore,
+    });
+
+    await _testOnly.handleMessage(adapter, {
+      messageId: 'msg-new',
+      address: { channelType: 'feishu', botName: 'ccbot', chatId: 'chat-1' },
+      text: '/new /tmp',
+      timestamp: Date.now(),
+    });
+
+    assert.ok(botStore.createdSessions.length > 0);
+    assert.equal(globalStore.createdSessions.length, 0);
+
+    botStore.permissionLink = {
+      permissionRequestId: 'perm-1',
+      chatId: 'chat-1',
+      messageId: 'perm-msg-1',
+      resolved: false,
+    };
+
+    await _testOnly.handleMessage(adapter, {
+      messageId: 'msg-callback',
+      address: { channelType: 'feishu', botName: 'ccbot', chatId: 'chat-1' },
+      text: '',
+      callbackData: 'perm:allow:perm-1',
+      callbackMessageId: 'perm-msg-1',
+      timestamp: Date.now(),
+    });
+
+    assert.deepEqual(botStore.resolvedPermissionIds, ['perm-1']);
+    assert.deepEqual(globalStore.resolvedPermissionIds, []);
+    assert.equal(adapter.sentMessages.length, 2);
+  });
 });
 
 function createMinimalStore(settings: Record<string, string> = {}): BridgeStore {
@@ -166,4 +235,88 @@ function createMinimalStore(settings: Record<string, string> = {}): BridgeStore 
     getChannelOffset: () => '0',
     setChannelOffset: () => {},
   };
+}
+
+function createTrackingStore(name: string) {
+  const createdSessions: string[] = [];
+  const resolvedPermissionIds: string[] = [];
+  let permissionLink: any = null;
+
+  return {
+    name,
+    createdSessions,
+    resolvedPermissionIds,
+    get permissionLink() { return permissionLink; },
+    set permissionLink(value: any) { permissionLink = value; },
+    getSetting: (key: string) => key === 'bridge_default_work_dir' ? '/default' : null,
+    getChannelBinding: () => null,
+    upsertChannelBinding: (binding: any) => ({
+      id: `${name}-binding`,
+      active: true,
+      createdAt: '',
+      updatedAt: '',
+      ...binding,
+    }),
+    updateChannelBinding: () => {},
+    listChannelBindings: () => [],
+    getSession: () => null,
+    createSession: () => {
+      const id = `${name}-session-${createdSessions.length + 1}`;
+      createdSessions.push(id);
+      return { id, working_directory: '/tmp', model: '' };
+    },
+    updateSessionProviderId: () => {},
+    addMessage: () => {},
+    getMessages: () => ({ messages: [] }),
+    acquireSessionLock: () => true,
+    renewSessionLock: () => {},
+    releaseSessionLock: () => {},
+    setSessionRuntimeStatus: () => {},
+    updateSdkSessionId: () => {},
+    updateSessionModel: () => {},
+    syncSdkTasks: () => {},
+    getProvider: () => undefined,
+    getDefaultProviderId: () => null,
+    insertAuditLog: () => {},
+    checkDedup: () => false,
+    insertDedup: () => {},
+    cleanupExpiredDedup: () => {},
+    insertOutboundRef: () => {},
+    insertPermissionLink: () => {},
+    getPermissionLink: (permissionRequestId: string) =>
+      permissionLink?.permissionRequestId === permissionRequestId ? permissionLink : null,
+    markPermissionLinkResolved: (permissionRequestId: string) => {
+      if (!permissionLink || permissionLink.permissionRequestId !== permissionRequestId) return false;
+      resolvedPermissionIds.push(permissionRequestId);
+      permissionLink.resolved = true;
+      return true;
+    },
+    listPendingPermissionLinksByChat: () => [],
+    getChannelOffset: () => '0',
+    setChannelOffset: () => {},
+  };
+}
+
+function createMockAdapter(opts: {
+  channelType: string;
+  instanceKey: string;
+  botStore?: BridgeStore;
+}): BaseChannelAdapter & { sentMessages: OutboundMessage[]; botStore?: BridgeStore } {
+  const sentMessages: OutboundMessage[] = [];
+  return {
+    channelType: opts.channelType,
+    get instanceKey() { return opts.instanceKey; },
+    botStore: opts.botStore,
+    sentMessages,
+    start: async () => {},
+    stop: async () => {},
+    isRunning: () => true,
+    consumeOne: async (): Promise<InboundMessage | null> => null,
+    send: async (message: OutboundMessage): Promise<SendResult> => {
+      sentMessages.push(message);
+      return { ok: true, messageId: `sent-${sentMessages.length}` };
+    },
+    validateConfig: () => null,
+    isAuthorized: () => true,
+  } as unknown as BaseChannelAdapter & { sentMessages: OutboundMessage[]; botStore?: BridgeStore };
 }
