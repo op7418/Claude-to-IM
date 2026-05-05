@@ -14,8 +14,8 @@ import * as bridgeManager from 'claude-to-im/src/lib/bridge/bridge-manager.js';
 import 'claude-to-im/src/lib/bridge/adapters/index.js';
 import './adapters/weixin-adapter.js';
 
-import type { LLMProvider } from 'claude-to-im/src/lib/bridge/host.js';
-import { loadConfig, configToSettings, CTI_HOME } from './config.js';
+import type { BridgeStore, LLMProvider } from 'claude-to-im/src/lib/bridge/host.js';
+import { loadConfig, configToSettings, parseFeishuBotConfigs, CTI_HOME } from './config.js';
 import type { Config } from './config.js';
 import { JsonFileStore } from './store.js';
 import { SDKLLMProvider, resolveClaudeCliPath, preflightCheck } from './llm-provider.js';
@@ -136,8 +136,15 @@ async function main(): Promise<void> {
     (config.minimaxApiKey ? ', LLM classifier: ready' : ', LLM classifier: no API key'),
   );
 
-  const settings = configToSettings(config);
-  const store = new JsonFileStore(settings);
+  const settingsMap = configToSettings(config);
+  const feishuBotConfigs = parseFeishuBotConfigs(settingsMap);
+  const globalStore = new JsonFileStore(settingsMap);
+  const botStores = new Map<string, BridgeStore>();
+  for (const botConfig of feishuBotConfigs) {
+    const dataDir = path.join(CTI_HOME, 'data', botConfig.name);
+    fs.mkdirSync(dataDir, { recursive: true });
+    botStores.set(botConfig.name, new JsonFileStore(settingsMap, dataDir));
+  }
   const pendingPerms = new PendingPermissions();
   const llm = await resolveProvider(config, pendingPerms);
   console.log(`[claude-to-im] Runtime: ${config.runtime}`);
@@ -148,7 +155,9 @@ async function main(): Promise<void> {
   };
 
   initBridgeContext({
-    store,
+    store: globalStore,
+    feishuBotConfigs,
+    botStores,
     llm,
     permissions: gateway,
     lifecycle: {

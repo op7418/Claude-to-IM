@@ -14,9 +14,12 @@ import type {
   PermissionGateway,
   LifecycleHooks,
 } from './host.js';
+import type { FeishuBotConfig } from './types.js';
 
 export interface BridgeContext {
   store: BridgeStore;
+  feishuBotConfigs?: FeishuBotConfig[];
+  botStores?: Map<string, BridgeStore>;
   llm: LLMProvider;
   permissions: PermissionGateway;
   lifecycle: LifecycleHooks;

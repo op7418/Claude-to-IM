@@ -9,6 +9,7 @@ export interface Config {
   defaultWorkDir: string;
   defaultModel?: string;
   defaultMode: string;
+  feishuBotConfigs?: FeishuBotConfig[];
   // Telegram
   tgBotToken?: string;
   tgChatId?: string;
@@ -155,6 +156,7 @@ export function loadConfig(): Config {
 
   const rawRuntime = env.get("CTI_RUNTIME") || "claude";
   const runtime = (["claude", "codex", "auto"].includes(rawRuntime) ? rawRuntime : "claude") as Config["runtime"];
+  const feishuBotConfigs = parseFeishuBotConfigs(env);
 
   return {
     runtime,
@@ -162,6 +164,7 @@ export function loadConfig(): Config {
     defaultWorkDir: env.get("CTI_DEFAULT_WORKDIR") || process.cwd(),
     defaultModel: env.get("CTI_DEFAULT_MODEL") || undefined,
     defaultMode: env.get("CTI_DEFAULT_MODE") || "code",
+    feishuBotConfigs,
     tgBotToken: env.get("CTI_TG_BOT_TOKEN") || undefined,
     tgChatId: env.get("CTI_TG_CHAT_ID") || undefined,
     tgAllowedUsers: splitCsv(env.get("CTI_TG_ALLOWED_USERS")),
@@ -286,6 +289,7 @@ export function maskSecret(value: string): string {
 
 export function configToSettings(config: Config): Map<string, string> {
   const m = new Map<string, string>();
+  m.set("CTI_HOME", CTI_HOME);
   m.set("remote_bridge_enabled", "true");
 
   // ── Telegram ──
@@ -338,6 +342,24 @@ export function configToSettings(config: Config): Map<string, string> {
     m.set("bridge_feishu_allowed_users", config.feishuAllowedUsers.join(","));
   if (config.feishuRequireMention !== undefined)
     m.set("bridge_feishu_require_mention", String(config.feishuRequireMention));
+  (config.feishuBotConfigs ?? []).forEach((bot, index) => {
+    const prefix = `CTI_FEISHU_BOTS_${index}_`;
+    m.set(`${prefix}NAME`, bot.name);
+    m.set(`${prefix}APP_ID`, bot.appId);
+    m.set(`${prefix}APP_SECRET`, bot.appSecret);
+    if (bot.domain) m.set(`${prefix}DOMAIN`, bot.domain);
+    if (bot.allowedUsers) m.set(`${prefix}ALLOWED_USERS`, bot.allowedUsers.join(","));
+    if (bot.requireMention !== undefined)
+      m.set(`${prefix}REQUIRE_MENTION`, String(bot.requireMention));
+    if (bot.groupPolicy) m.set(`${prefix}GROUP_POLICY`, bot.groupPolicy);
+    if (bot.groupAllowFrom) m.set(`${prefix}GROUP_ALLOW_FROM`, bot.groupAllowFrom.join(","));
+    if (bot.workingDirectory) m.set(`${prefix}WORKING_DIR`, bot.workingDirectory);
+    for (const [userId, override] of bot.userOverrides ?? []) {
+      if (override.workingDirectory) {
+        m.set(`${prefix}USER_${userId}_WORKING_DIR`, override.workingDirectory);
+      }
+    }
+  });
 
   // ── QQ ──
   // Upstream keys: bridge_qq_enabled, bridge_qq_app_id, bridge_qq_app_secret,
