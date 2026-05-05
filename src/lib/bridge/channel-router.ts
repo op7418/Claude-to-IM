@@ -6,23 +6,52 @@
  */
 
 import type { ChannelAddress, ChannelBinding, ChannelType } from './types.js';
+import type { BridgeStore } from './host.js';
 import { getBridgeContext } from './context.js';
+
+export interface RouterOpts {
+  store: BridgeStore;
+  workingDirectory?: string;
+}
+
+type CreateBindingArg = RouterOpts | string | undefined;
+
+function getRouterStore(opts?: RouterOpts): BridgeStore {
+  return opts?.store ?? getBridgeContext().store;
+}
+
+function getCreateBindingOpts(arg: CreateBindingArg): {
+  store: BridgeStore;
+  workingDirectory?: string;
+} {
+  if (typeof arg === 'string') {
+    return {
+      store: getRouterStore(),
+      workingDirectory: arg,
+    };
+  }
+
+  return {
+    store: getRouterStore(arg),
+    workingDirectory: arg?.workingDirectory,
+  };
+}
 
 /**
  * Resolve an inbound address to a ChannelBinding.
  * If no binding exists, auto-creates a new session and binding.
  */
-export function resolve(address: ChannelAddress): ChannelBinding {
-  const { store } = getBridgeContext();
-  const existing = store.getChannelBinding(address.channelType, address.chatId);
+export function resolve(address: ChannelAddress, opts?: RouterOpts): ChannelBinding {
+  const store = getRouterStore(opts);
+  const existing = store.getChannelBinding(address.channelType, address.chatId, address.botName);
   if (existing) {
     // Verify the linked session still exists; if not, create a new one
     const session = store.getSession(existing.codepilotSessionId);
     if (session) return existing;
     // Session was deleted — recreate
-    return createBinding(address);
+    return createBinding(address, opts);
   }
-  return createBinding(address);
+  return createBinding(address, opts);
 }
 
 /**
@@ -30,9 +59,9 @@ export function resolve(address: ChannelAddress): ChannelBinding {
  */
 export function createBinding(
   address: ChannelAddress,
-  workingDirectory?: string,
+  optsOrWorkingDirectory?: CreateBindingArg,
 ): ChannelBinding {
-  const { store } = getBridgeContext();
+  const { store, workingDirectory } = getCreateBindingOpts(optsOrWorkingDirectory);
   const defaultCwd = workingDirectory
     || store.getSetting('bridge_default_work_dir')
     || process.env.HOME
@@ -55,6 +84,7 @@ export function createBinding(
 
   return store.upsertChannelBinding({
     channelType: address.channelType,
+    botName: address.botName,
     chatId: address.chatId,
     codepilotSessionId: session.id,
     sdkSessionId: '',
@@ -70,13 +100,15 @@ export function createBinding(
 export function bindToSession(
   address: ChannelAddress,
   codepilotSessionId: string,
+  opts?: RouterOpts,
 ): ChannelBinding | null {
-  const { store } = getBridgeContext();
+  const store = getRouterStore(opts);
   const session = store.getSession(codepilotSessionId);
   if (!session) return null;
 
   return store.upsertChannelBinding({
     channelType: address.channelType,
+    botName: address.botName,
     chatId: address.chatId,
     codepilotSessionId,
     workingDirectory: session.working_directory,
@@ -90,13 +122,14 @@ export function bindToSession(
 export function updateBinding(
   id: string,
   updates: Partial<Pick<ChannelBinding, 'sdkSessionId' | 'workingDirectory' | 'model' | 'mode' | 'active'>>,
+  opts?: RouterOpts,
 ): void {
-  getBridgeContext().store.updateChannelBinding(id, updates);
+  getRouterStore(opts).updateChannelBinding(id, updates);
 }
 
 /**
  * List all bindings, optionally filtered by channel type.
  */
-export function listBindings(channelType?: ChannelType): ChannelBinding[] {
-  return getBridgeContext().store.listChannelBindings(channelType);
+export function listBindings(channelType?: ChannelType, opts?: RouterOpts): ChannelBinding[] {
+  return getRouterStore(opts).listChannelBindings(channelType);
 }
