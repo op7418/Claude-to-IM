@@ -12,10 +12,16 @@ import type {
   PreviewCapabilities,
   SendResult,
 } from './types.js';
+import type { BridgeStore } from './host.js';
 
 export abstract class BaseChannelAdapter {
   /** Which channel type this adapter handles */
   abstract readonly channelType: ChannelType;
+
+  /** Unique adapter instance key. Defaults to the channel type for single-instance adapters. */
+  get instanceKey(): string {
+    return this.channelType;
+  }
 
   /**
    * Start the adapter (connect, begin polling/websocket, etc.).
@@ -116,19 +122,33 @@ export abstract class BaseChannelAdapter {
    * Returns true if a card was finalized (caller should skip normal delivery).
    */
   onStreamEnd?(_chatId: string, _status: 'completed' | 'interrupted' | 'error', _responseText: string): Promise<boolean>;
+
+  /**
+   * Send a file (image or document) to the channel.
+   * Not all adapters support this — default returns failure.
+   * @param chatId - Platform-specific chat identifier
+   * @param filePath - Absolute path to the file on disk
+   * @param fileName - Display name for the file
+   */
+  async sendFile(_chatId: string, _filePath: string, _fileName: string): Promise<SendResult> {
+    return { ok: false, error: 'File sending not supported by this adapter' };
+  }
 }
 
 // ── Adapter Registry ────────────────────────────────────────────
 
-const adapterFactories = new Map<string, () => BaseChannelAdapter>();
+export type AdapterFactory = (config?: unknown, store?: BridgeStore) => BaseChannelAdapter;
 
-export function registerAdapterFactory(channelType: string, factory: () => BaseChannelAdapter): void {
+const adapterFactories = new Map<string, AdapterFactory>();
+
+export function registerAdapterFactory(channelType: string, factory: AdapterFactory): void {
   adapterFactories.set(channelType, factory);
 }
 
-export function createAdapter(channelType: string): BaseChannelAdapter | null {
+export function createAdapter(channelType: ChannelType, config?: unknown, store?: BridgeStore): BaseChannelAdapter {
   const factory = adapterFactories.get(channelType);
-  return factory ? factory() : null;
+  if (!factory) throw new Error(`No adapter factory for ${channelType}`);
+  return factory(config, store);
 }
 
 export function getRegisteredTypes(): string[] {

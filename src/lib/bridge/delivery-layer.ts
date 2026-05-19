@@ -13,6 +13,7 @@ import type {
 import type { TelegramChunk } from './markdown/telegram.js';
 import { PLATFORM_LIMITS as limits } from './types.js';
 import type { BaseChannelAdapter } from './channel-adapter.js';
+import type { BridgeStore } from './host.js';
 import { getBridgeContext } from './context.js';
 import { ChatRateLimiter } from './security/rate-limiter.js';
 
@@ -140,20 +141,21 @@ export async function deliver(
   opts?: {
     sessionId?: string;
     dedupKey?: string;
+    store?: BridgeStore;
   },
 ): Promise<SendResult> {
-  const { store } = getBridgeContext();
+  const s = opts?.store || getBridgeContext().store;
 
   // Dedup check
   if (opts?.dedupKey) {
-    if (store.checkDedup(opts.dedupKey)) {
+    if (s.checkDedup(opts.dedupKey)) {
       return { ok: true, messageId: undefined };
     }
   }
 
   // Periodically clean up expired dedup entries (1 in 100 chance)
   if (Math.random() < 0.01) {
-    try { store.cleanupExpiredDedup(); } catch { /* best effort */ }
+    try { s.cleanupExpiredDedup(); } catch { /* best effort */ }
   }
 
   const limit = limits[adapter.channelType] || 4096;
@@ -198,7 +200,7 @@ export async function deliver(
     // Track outbound reference
     if (result.messageId && opts?.sessionId) {
       try {
-        store.insertOutboundRef({
+        s.insertOutboundRef({
           channelType: adapter.channelType,
           chatId: message.address.chatId,
           codepilotSessionId: opts.sessionId,
@@ -211,12 +213,12 @@ export async function deliver(
 
   // Mark as delivered for dedup
   if (opts?.dedupKey) {
-    try { store.insertDedup(opts.dedupKey); } catch { /* best effort */ }
+    try { s.insertDedup(opts.dedupKey); } catch { /* best effort */ }
   }
 
   // Audit log
   try {
-    store.insertAuditLog({
+    s.insertAuditLog({
       channelType: adapter.channelType,
       chatId: message.address.chatId,
       direction: 'outbound',
@@ -284,18 +286,18 @@ export async function deliverRendered(
   adapter: BaseChannelAdapter,
   address: ChannelAddress,
   chunks: TelegramChunk[],
-  opts?: { sessionId?: string; dedupKey?: string; replyToMessageId?: string },
+  opts?: { sessionId?: string; dedupKey?: string; replyToMessageId?: string; store?: BridgeStore },
 ): Promise<SendResult> {
-  const { store } = getBridgeContext();
+  const s = opts?.store || getBridgeContext().store;
 
   // Dedup check
   if (opts?.dedupKey) {
-    if (store.checkDedup(opts.dedupKey)) {
+    if (s.checkDedup(opts.dedupKey)) {
       return { ok: true, messageId: undefined };
     }
   }
   if (Math.random() < 0.01) {
-    try { store.cleanupExpiredDedup(); } catch { /* best effort */ }
+    try { s.cleanupExpiredDedup(); } catch { /* best effort */ }
   }
 
   let lastMessageId: string | undefined;
@@ -329,7 +331,7 @@ export async function deliverRendered(
 
     if (result.messageId && opts?.sessionId) {
       try {
-        store.insertOutboundRef({
+        s.insertOutboundRef({
           channelType: adapter.channelType,
           chatId: address.chatId,
           codepilotSessionId: opts.sessionId,
@@ -347,11 +349,11 @@ export async function deliverRendered(
   }
 
   if (opts?.dedupKey) {
-    try { store.insertDedup(opts.dedupKey); } catch { /* best effort */ }
+    try { s.insertDedup(opts.dedupKey); } catch { /* best effort */ }
   }
 
   try {
-    store.insertAuditLog({
+    s.insertAuditLog({
       channelType: adapter.channelType,
       chatId: address.chatId,
       direction: 'outbound',

@@ -93,15 +93,32 @@ export function htmlToFeishuMarkdown(html: string): string {
 
 /**
  * Build tool progress markdown lines.
- * Each tool shows an icon based on status: 🔄 Running, ✅ Complete, ❌ Error.
+ *
+ * Always renders a non-empty line as long as at least one tool has been seen,
+ * so the card never collapses back to "💭 Thinking..." between two tool calls
+ * just because the previous one moved from running → complete.
+ *
+ * Format:
+ *   - running tool present:  "⏳ <currentToolName> · 已完成 X/Y 步"
+ *   - all tools complete:    "✅ 已完成 X 步"
+ *   - tools.length === 0:    "" (no tools yet)
  */
 export function buildToolProgressMarkdown(tools: ToolCallInfo[]): string {
   if (tools.length === 0) return '';
-  const lines = tools.map((tc) => {
-    const icon = tc.status === 'running' ? '🔄' : tc.status === 'complete' ? '✅' : '❌';
-    return `${icon} \`${tc.name}\``;
-  });
-  return lines.join('\n');
+  const total = tools.length;
+  const completed = tools.filter(
+    (tc) => tc.status === 'complete' || tc.status === 'error',
+  ).length;
+  // Pick the most recently added running tool (Map preserves insertion order).
+  let current: ToolCallInfo | undefined;
+  for (const tc of tools) {
+    if (tc.status === 'running') current = tc;
+  }
+  if (current) {
+    const name = current.name || 'tool';
+    return `⏳ ${name} · 已完成 ${completed}/${total} 步`;
+  }
+  return `✅ 已完成 ${total} 步`;
 }
 
 /**
@@ -177,9 +194,17 @@ export function buildFinalCardJson(
   });
 }
 
+function normalizePermissionCardMarkdown(text: string): string {
+  return preprocessFeishuMarkdown(text)
+    .replace(/^\*\*Permission Required\*\*\s*/u, '')
+    .replace(/\n*Choose an action:\s*$/u, '')
+    .trim();
+}
+
 /**
  * Build a permission card with real action buttons (column_set layout).
- * Structure aligned with CodePilot's working Feishu outbound implementation.
+ * Uses the same warning-card visual language as OpenClaw approvals while
+ * keeping bridge-native button semantics intact.
  * Returns the card JSON string for msg_type: 'interactive'.
  */
 export function buildPermissionButtonCard(
@@ -187,11 +212,12 @@ export function buildPermissionButtonCard(
   permissionRequestId: string,
   chatId?: string,
 ): string {
+  const content = normalizePermissionCardMarkdown(text);
   const buttons = [
     { label: 'Allow', type: 'primary', action: 'allow' },
     { label: 'Allow Session', type: 'default', action: 'allow_session' },
     { label: 'Deny', type: 'danger', action: 'deny' },
-  ];
+  ] as const;
 
   const buttonColumns = buttons.map((btn) => ({
     tag: 'column',
@@ -207,29 +233,25 @@ export function buildPermissionButtonCard(
 
   return JSON.stringify({
     schema: '2.0',
-    config: { wide_screen_mode: true },
+    config: { wide_screen_mode: true, update_multi: true },
     header: {
-      title: { tag: 'plain_text', content: 'Permission Required' },
-      template: 'blue',
-      icon: { tag: 'standard_icon', token: 'lock-chat_filled' },
+      title: { tag: 'plain_text', content: 'Approval Required' },
+      template: 'orange',
       padding: '12px 12px 12px 12px',
+      text_tag_list: [
+        { tag: 'text_tag', text: { tag: 'plain_text', content: 'pending' }, color: 'orange' },
+      ],
     },
     body: {
       elements: [
-        { tag: 'markdown', content: text, text_size: 'normal' },
-        { tag: 'markdown', content: '⏱ This request will expire in 5 minutes', text_size: 'notation' },
+        { tag: 'markdown', content: content, text_size: 'normal', text_align: 'left' },
+        { tag: 'markdown', content: 'This approval stays interactive in Feishu. Use the buttons below.', text_size: 'notation' },
         { tag: 'hr' },
         {
           tag: 'column_set',
           flex_mode: 'none',
           horizontal_align: 'left',
           columns: buttonColumns,
-        },
-        { tag: 'hr' },
-        {
-          tag: 'markdown',
-          content: 'Or reply: `1` Allow · `2` Allow Session · `3` Deny',
-          text_size: 'notation',
         },
       ],
     },
