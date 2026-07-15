@@ -172,7 +172,10 @@ export function buildFinalCardJson(
 
   return JSON.stringify({
     schema: '2.0',
-    config: { wide_screen_mode: true },
+    config: {
+      wide_screen_mode: true,
+      streaming_mode: false,
+    },
     body: { elements },
   });
 }

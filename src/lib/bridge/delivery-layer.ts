@@ -185,6 +185,8 @@ export async function deliver(
       text: chunks[i],
       // Only attach inline buttons to the last chunk
       inlineButtons: i === chunks.length - 1 ? message.inlineButtons : undefined,
+      // Only attach files/media to the last chunk so uploads are not duplicated.
+      attachments: i === chunks.length - 1 ? message.attachments : undefined,
       // Pass through replyToMessageId for platforms that need it (e.g. QQ passive reply)
       replyToMessageId: message.replyToMessageId,
     };
@@ -239,7 +241,15 @@ async function sendWithRetry(
   let lastError: string | undefined;
 
   for (let attempt = 0; attempt < MAX_RETRIES; attempt++) {
-    const result = await adapter.send(message);
+    let result: SendResult;
+    try {
+      result = await adapter.send(message);
+    } catch (err) {
+      result = {
+        ok: false,
+        error: err instanceof Error ? err.message : String(err),
+      };
+    }
     if (result.ok) return result;
 
     lastError = result.error;

@@ -57,6 +57,24 @@ export interface InboundMessage {
 }
 
 /** Outbound message to send to an IM channel */
+export interface OutboundAttachment {
+  /** Attachment kind; channels may infer this from type/name if omitted. */
+  kind?: 'file' | 'video' | 'image';
+  /** Local filesystem path for artifacts produced on this computer. */
+  path?: string;
+  /** Alias used by some bridge components. */
+  filePath?: string;
+  /** Display filename. */
+  name?: string;
+  /** MIME type. */
+  type?: string;
+  /** Byte size when known. */
+  size?: number;
+  /** Base64 data for in-memory attachments. */
+  data?: string;
+}
+
+/** Outbound message to send to an IM channel */
 export interface OutboundMessage {
   /** Target address */
   address: ChannelAddress;
@@ -68,6 +86,8 @@ export interface OutboundMessage {
   inlineButtons?: InlineButton[][];
   /** If replying to a specific message */
   replyToMessageId?: string;
+  /** Files or media to send after the text body */
+  attachments?: OutboundAttachment[];
 }
 
 /** Inline keyboard button for permission prompts */

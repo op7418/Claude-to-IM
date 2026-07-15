@@ -146,6 +146,33 @@ describe('delivery-layer', () => {
     }
   });
 
+  it('keeps outbound attachments only on the final text chunk', async () => {
+    const sentMessages: OutboundMessage[] = [];
+    const adapter = createMockAdapter({
+      sendFn: async (msg) => {
+        sentMessages.push(msg);
+        return { ok: true, messageId: `msg-${sentMessages.length}` };
+      },
+    });
+
+    const longText = 'Line\n'.repeat(2000);
+    const result = await deliver(adapter, {
+      address: { channelType: 'weixin', chatId: 'wx-chat' },
+      text: longText,
+      parseMode: 'plain',
+      attachments: [
+        { kind: 'video', path: 'D:\\-\\result\\clip.mp4', name: 'clip.mp4', type: 'video/mp4' },
+      ],
+    });
+
+    assert.ok(result.ok);
+    assert.ok(sentMessages.length > 1);
+    assert.equal(sentMessages.slice(0, -1).every((msg) => !msg.attachments), true);
+    assert.deepEqual(sentMessages.at(-1)?.attachments, [
+      { kind: 'video', path: 'D:\\-\\result\\clip.mp4', name: 'clip.mp4', type: 'video/mp4' },
+    ]);
+  });
+
   it('skips delivery when dedup key already exists', async () => {
     store.dedupKeys.add('dedup-1');
     const adapter = createMockAdapter();

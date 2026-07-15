@@ -79,6 +79,7 @@ type RenderState = RenderTarget & {
   env: RenderEnv;
   headingStyle: 'none' | 'bold';
   blockquotePrefix: string;
+  tableStyle: 'code' | 'bullets';
   table: TableState | null;
 };
 
@@ -88,6 +89,7 @@ export type MarkdownParseOptions = {
   blockquotePrefix?: string;
   autolink?: boolean;
   enableTables?: boolean;
+  tableStyle?: 'code' | 'bullets';
 };
 
 function createMarkdownIt(options: MarkdownParseOptions): MarkdownIt {
@@ -322,13 +324,9 @@ function renderTableAsBullets(state: RenderState) {
 
       const rowLabel = row[0];
       if (rowLabel?.text) {
-        const labelStart = state.text.length;
+        state.text += '【';
         appendCell(state, rowLabel);
-        const labelEnd = state.text.length;
-        if (labelEnd > labelStart) {
-          state.styles.push({ start: labelStart, end: labelEnd, style: 'bold' });
-        }
-        state.text += '\n';
+        state.text += '】\n';
       }
 
       for (let i = 1; i < row.length; i++) {
@@ -337,7 +335,7 @@ function renderTableAsBullets(state: RenderState) {
         if (!value?.text) {
           continue;
         }
-        state.text += '• ';
+        state.text += '- ';
         if (header?.text) {
           appendCell(state, header);
           state.text += ': ';
@@ -357,7 +355,7 @@ function renderTableAsBullets(state: RenderState) {
         if (!value?.text) {
           continue;
         }
-        state.text += '• ';
+        state.text += '- ';
         if (header?.text) {
           appendCell(state, header);
           state.text += ': ';
@@ -572,7 +570,11 @@ function renderTokens(tokens: MarkdownToken[], state: RenderState): void {
         break;
       case 'table_close':
         if (state.table) {
-          renderTableAsCode(state);
+          if (state.tableStyle === 'bullets') {
+            renderTableAsBullets(state);
+          } else {
+            renderTableAsCode(state);
+          }
         }
         state.table = null;
         break;
@@ -766,6 +768,7 @@ export function markdownToIR(markdown: string, options: MarkdownParseOptions = {
     env,
     headingStyle: options.headingStyle ?? 'none',
     blockquotePrefix: options.blockquotePrefix ?? '',
+    tableStyle: options.tableStyle ?? 'code',
     table: null,
   };
 
