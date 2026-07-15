@@ -7,7 +7,10 @@
  * Uses globalThis to survive Next.js HMR in development.
  */
 
-import type { BridgeStatus, InboundMessage, OutboundMessage, StreamingPreviewState, ToolCallInfo } from './types.js';
+import type { BridgeStatus, InboundMessage, OutboundAttachment, OutboundMessage, StreamingPreviewState, ToolCallInfo } from './types.js';
+import fs from 'node:fs';
+import path from 'node:path';
+import { pathToFileURL } from 'node:url';
 import { createAdapter, getRegisteredTypes } from './channel-adapter.js';
 import type { BaseChannelAdapter } from './channel-adapter.js';
 // Side-effect import: triggers self-registration of all adapter factories
@@ -18,6 +21,8 @@ import * as broker from './permission-broker.js';
 import { deliver, deliverRendered } from './delivery-layer.js';
 import { markdownToTelegramChunks } from './markdown/telegram.js';
 import { markdownToDiscordChunks } from './markdown/discord.js';
+import { markdownToWeixinText } from './markdown/weixin.js';
+import { captureInboxMessage, parseInboxCaptureMessage } from './material-inbox.js';
 import { getBridgeContext } from './context.js';
 import { escapeHtml } from './adapters/telegram-utils.js';
 import {
@@ -27,8 +32,18 @@ import {
   sanitizeInput,
   validateMode,
 } from './security/validators.js';
+import type { FileAttachment } from './host.js';
 
 const GLOBAL_KEY = '__bridge_manager__';
+
+type CodexRemoteHandler = (message: Record<string, unknown>) => Promise<{
+  attachments?: OutboundAttachment[];
+  silent?: boolean;
+  text?: string;
+  response?: { attachments?: OutboundAttachment[]; reply?: string; silent?: boolean };
+}>;
+
+const codexRemoteHandlerCache = new Map<string, Promise<CodexRemoteHandler>>();
 
 // ── Streaming preview helpers ──────────────────────────────────
 
@@ -146,6 +161,14 @@ async function deliverResponse(
       replyToMessageId,
     }, { sessionId });
   }
+  if (adapter.channelType === 'weixin') {
+    return deliver(adapter, {
+      address,
+      text: markdownToWeixinText(responseText),
+      parseMode: 'plain',
+      replyToMessageId,
+    }, { sessionId });
+  }
   // Generic fallback: deliver as plain text (deliver() handles chunking internally)
   return deliver(adapter, {
     address,
@@ -153,6 +176,148 @@ async function deliverResponse(
     parseMode: 'plain',
     replyToMessageId,
   }, { sessionId });
+}
+
+function getCodexRemoteWorkspaceRoot(): string {
+  const { store } = getBridgeContext();
+  return store.getSetting('bridge_weixin_codex_workspace_root')
+    || store.getSetting('bridge_default_work_dir')
+    || process.env.CWRC_WORKSPACE_ROOT
+    || process.cwd();
+}
+
+function getCodexRemoteAdapterPath(): string {
+  const { store } = getBridgeContext();
+  const configured = store.getSetting('bridge_weixin_codex_controller_path')
+    || process.env.CWRC_WECHAT_ADAPTER_PATH;
+
+  if (configured) {
+    return path.resolve(configured);
+  }
+
+  return path.join(
+    getCodexRemoteWorkspaceRoot(),
+    'Projects_Services',
+    'Project_Codex_Wechat_Remote_Controller',
+    'src',
+    'wechat-adapter.mjs',
+  );
+}
+
+function getCodexRemoteHandler(): Promise<CodexRemoteHandler> {
+  const adapterPath = getCodexRemoteAdapterPath();
+  const workspaceRoot = getCodexRemoteWorkspaceRoot();
+  const cacheKey = `${adapterPath}|${workspaceRoot}`;
+
+  if (!codexRemoteHandlerCache.has(cacheKey)) {
+    const handlerPromise = loadCodexRemoteHandler(adapterPath, workspaceRoot).catch(err => {
+      codexRemoteHandlerCache.delete(cacheKey);
+      throw err;
+    });
+    codexRemoteHandlerCache.set(cacheKey, handlerPromise);
+  }
+
+  return codexRemoteHandlerCache.get(cacheKey)!;
+}
+
+async function loadCodexRemoteHandler(adapterPath: string, workspaceRoot: string): Promise<CodexRemoteHandler> {
+  if (!fs.existsSync(adapterPath)) {
+    throw new Error(`Codex remote controller adapter not found: ${adapterPath}`);
+  }
+
+  const module = await import(pathToFileURL(adapterPath).href) as {
+    createWeChatMessageHandler?: (options?: Record<string, unknown>) => CodexRemoteHandler;
+  };
+
+  if (typeof module.createWeChatMessageHandler !== 'function') {
+    throw new Error(`Codex remote controller adapter does not export createWeChatMessageHandler: ${adapterPath}`);
+  }
+
+  return module.createWeChatMessageHandler({ config: { workspaceRoot } });
+}
+
+async function handleWeixinCodexRemoteController(
+  adapter: BaseChannelAdapter,
+  msg: InboundMessage,
+  rawText: string,
+): Promise<void> {
+  const { store } = getBridgeContext();
+  const handler = await getCodexRemoteHandler();
+  const sendReply = async (text: unknown) => {
+    const normalizedReply = normalizeCodexRemoteReply(text);
+    const replyText = normalizedReply.text;
+    if (!replyText && !normalizedReply.attachments?.length) return;
+    await deliver(adapter, {
+      address: msg.address,
+      text: replyText,
+      parseMode: 'plain',
+      replyToMessageId: msg.messageId,
+      attachments: normalizedReply.attachments,
+    });
+  };
+  const output = await handler({
+    chatId: msg.address.chatId,
+    content: rawText,
+    createTime: msg.timestamp,
+    fromUserName: msg.address.userId || msg.address.chatId,
+    id: msg.messageId,
+    sendReply,
+  });
+  const reply = normalizeCodexRemoteReply(output);
+  const silent = output.silent === true || output.response?.silent === true;
+
+  store.insertAuditLog({
+    channelType: adapter.channelType,
+    chatId: msg.address.chatId,
+    direction: 'inbound',
+    messageId: msg.messageId,
+    summary: `[CWRC] ${rawText.slice(0, 200)}`,
+  });
+
+  if (silent) {
+    store.insertAuditLog({
+      channelType: adapter.channelType,
+      chatId: msg.address.chatId,
+      direction: 'outbound',
+      messageId: msg.messageId,
+      summary: '[CWRC_SILENT] reply suppressed',
+    });
+    return;
+  }
+
+  await sendReply(reply.text || reply.attachments?.length
+    ? reply
+    : 'Codex remote controller returned an empty reply.');
+}
+
+function normalizeCodexRemoteReply(payload: unknown): { text: string; attachments?: OutboundAttachment[] } {
+  if (typeof payload === 'string') {
+    return { text: payload };
+  }
+  if (!payload || typeof payload !== 'object') {
+    return { text: String(payload ?? '') };
+  }
+
+  const record = payload as {
+    attachments?: unknown;
+    reply?: unknown;
+    response?: { attachments?: unknown; reply?: unknown };
+    text?: unknown;
+  };
+  const text = typeof record.text === 'string'
+    ? record.text
+    : typeof record.reply === 'string'
+      ? record.reply
+      : typeof record.response?.reply === 'string'
+        ? record.response.reply
+        : '';
+  const attachments = Array.isArray(record.attachments)
+    ? record.attachments as OutboundAttachment[]
+    : Array.isArray(record.response?.attachments)
+      ? record.response.attachments as OutboundAttachment[]
+      : undefined;
+
+  return { text, attachments };
 }
 
 interface AdapterMeta {
@@ -557,8 +722,8 @@ async function handleMessage(
         return;
       }
       // pendingLinks.length === 0: no pending permissions, fall through as normal message
-    } else if (rawText !== normalized && /^[123]$/.test(rawText) === false) {
-      // Log when normalization changed the text — helps diagnose encoding issues
+    } else if (rawText !== normalized && /^[１２３1-3\u200B-\u200D\uFEFF\s]+$/u.test(rawText)) {
+      // Log only numeric shortcut candidates changed by normalization.
       const codePoints = [...rawText].map(c => 'U+' + c.codePointAt(0)!.toString(16).toUpperCase().padStart(4, '0'));
       console.log(`[bridge-manager] Shortcut candidate raw codepoints: ${codePoints.join(' ')} → normalized: "${normalized}"`);
     }
@@ -567,6 +732,113 @@ async function handleMessage(
   // Check for IM commands (before sanitization — commands are validated individually)
   if (rawText.startsWith('/')) {
     await handleCommand(adapter, msg, rawText);
+    ack();
+    return;
+  }
+
+  if (
+    adapter.channelType === 'weixin'
+    && !hasAttachments
+    && store.getSetting('bridge_weixin_codex_controller_enabled') === 'true'
+  ) {
+    try {
+      await handleWeixinCodexRemoteController(adapter, msg, rawText);
+    } catch (err) {
+      const errorMessage = err instanceof Error ? err.message : String(err);
+      store.insertAuditLog({
+        channelType: adapter.channelType,
+        chatId: msg.address.chatId,
+        direction: 'inbound',
+        messageId: msg.messageId,
+        summary: `[CWRC_ERROR] ${errorMessage}`,
+      });
+      await deliver(adapter, {
+        address: msg.address,
+        text: `Codex remote controller failed: ${errorMessage}`,
+        parseMode: 'plain',
+        replyToMessageId: msg.messageId,
+      });
+    }
+    ack();
+    return;
+  }
+
+  const inboxRawText = adapter.channelType === 'weixin'
+    ? buildInboxCaptureRawText(rawText, msg.attachments)
+    : rawText;
+  const inboxPayload = parseInboxCaptureMessage(inboxRawText, { allowBare: adapter.channelType === 'weixin' });
+  if (inboxPayload) {
+    const binding = router.resolve(msg.address);
+
+    if (!inboxPayload.body) {
+      await deliver(adapter, {
+        address: msg.address,
+        text: '已识别为 inbox 捕捉，但内容为空。请使用“灵感：内容”或“素材：内容”格式发送。',
+        parseMode: 'plain',
+        replyToMessageId: msg.messageId,
+      }, { sessionId: binding.codepilotSessionId });
+      ack();
+      return;
+    }
+
+    try {
+      const captured = captureInboxMessage({
+        workingDirectory: binding.workingDirectory,
+        channelType: adapter.channelType,
+        chatId: msg.address.chatId,
+        messageId: msg.messageId,
+        timestamp: msg.timestamp,
+        displayName: msg.address.displayName,
+        rawText: inboxRawText,
+        allowBare: adapter.channelType === 'weixin',
+      });
+
+      store.insertAuditLog({
+        channelType: adapter.channelType,
+        chatId: msg.address.chatId,
+        direction: 'inbound',
+        messageId: msg.messageId,
+        summary: `[INBOX] ${captured.inboxId} ${captured.relativePath}`,
+      });
+
+      store.addMessage(
+        binding.codepilotSessionId,
+        'user',
+        [
+          `[手机 inbox] ID=${captured.inboxId}`,
+          `入口=${captured.kind}`,
+          `标签=${captured.label || '无'}`,
+          `路径=${captured.relativePath}`,
+          `摘要=${captured.preview}`,
+        ].join('；'),
+      );
+      store.addMessage(
+        binding.codepilotSessionId,
+        'assistant',
+        `已存入 inbox ${captured.inboxId}。电脑打开后可核验、整理，再决定是否进入 raw/wiki/projects。`,
+      );
+
+      await deliver(adapter, {
+        address: msg.address,
+        text: [
+          `已存入 Inbox ${captured.inboxId}`,
+          `路径：${captured.relativePath}`,
+          `摘要：${captured.preview}`,
+          '电脑打开后可统一核验，再整理进 raw / wiki / projects。',
+        ].join('\n'),
+        parseMode: 'plain',
+        replyToMessageId: msg.messageId,
+      }, { sessionId: binding.codepilotSessionId });
+    } catch (err) {
+      const errorMessage = err instanceof Error ? err.message : String(err);
+      await deliver(adapter, {
+        address: msg.address,
+        text: `Inbox 入库失败：${errorMessage}`,
+        parseMode: 'plain',
+        replyToMessageId: msg.messageId,
+      }, { sessionId: binding.codepilotSessionId });
+    }
+
     ack();
     return;
   }
@@ -725,7 +997,43 @@ async function handleMessage(
     // Skip if streaming card was finalized (content already in card).
     if (result.responseText) {
       if (!cardFinalized) {
-        await deliverResponse(adapter, msg.address, result.responseText, binding.codepilotSessionId, msg.messageId);
+        const deliveryResult = await deliverResponse(
+          adapter,
+          msg.address,
+          result.responseText,
+          binding.codepilotSessionId,
+          msg.messageId,
+        );
+        if (!deliveryResult.ok) {
+          console.warn(
+            '[bridge-manager] Final response delivery failed:',
+            JSON.stringify({
+              channelType: adapter.channelType,
+              chatId: msg.address.chatId,
+              sessionId: binding.codepilotSessionId,
+              error: deliveryResult.error ?? 'unknown',
+            }),
+          );
+
+          const noticeResult = await deliver(adapter, {
+            address: msg.address,
+            text: '结果已经生成，但回传消息失败了。你可以回复“重发简版”，我会用更短的格式再发一次。',
+            parseMode: 'plain',
+            replyToMessageId: msg.messageId,
+          }, { sessionId: binding.codepilotSessionId });
+
+          if (!noticeResult.ok) {
+            console.warn(
+              '[bridge-manager] Delivery failure notice also failed:',
+              JSON.stringify({
+                channelType: adapter.channelType,
+                chatId: msg.address.chatId,
+                sessionId: binding.codepilotSessionId,
+                error: noticeResult.error ?? 'unknown',
+              }),
+            );
+          }
+        }
       }
     } else if (result.hasError) {
       const errorResponse: OutboundMessage = {
@@ -771,6 +1079,31 @@ async function handleMessage(
     // Commit the offset only after full processing (success or failure)
     ack();
   }
+}
+
+function buildInboxCaptureRawText(rawText: string, attachments?: FileAttachment[]): string {
+  const parts: string[] = [];
+  const trimmedText = rawText.trim();
+  if (trimmedText) {
+    parts.push(trimmedText);
+  }
+
+  if (attachments?.length) {
+    parts.push([
+      '附件：',
+      ...attachments.map((attachment, index) => {
+        const fields = [
+          `${index + 1}. ${attachment.name || attachment.id || '未命名附件'}`,
+          `类型=${attachment.type || 'unknown'}`,
+          `大小=${attachment.size ?? 0} bytes`,
+          attachment.filePath ? `路径=${attachment.filePath}` : '',
+        ].filter(Boolean);
+        return `- ${fields.join('；')}`;
+      }),
+    ].join('\n'));
+  }
+
+  return parts.join('\n\n');
 }
 
 /**
